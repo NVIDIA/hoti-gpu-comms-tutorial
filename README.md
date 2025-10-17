@@ -45,6 +45,7 @@ python3 -V
 
 ```
 nccl/
+  lab1/     # NCCL basics (unsolved + solved)
   lab3/     # Jacobi with NCCL (unsolved + solved)
   lab5/     # NCCL symmetric memory kernels (unsolved + solved)
 nvshmem/
