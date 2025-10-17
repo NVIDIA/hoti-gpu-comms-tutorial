@@ -1,0 +1,5 @@
+cupy-cuda12x
+numpy
+mpi4py
+cuda-python==12.9.1
+
