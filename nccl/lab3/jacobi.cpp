@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2021-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
  * Redistribution and use in source and binary forms, with or without
@@ -220,8 +220,8 @@ int main(int argc, char* argv[]) {
     NCCL_CALL(ncclCommInitRank(&nccl_comm, size, nccl_uid, rank));
     int nccl_version = 0;
     NCCL_CALL(ncclGetVersion(&nccl_version));
-    if ( nccl_version < 2800 ) {
-        fprintf(stderr,"ERROR NCCL 2.8 or newer is required.\n");
+    if ( nccl_version < 2270 ) {
+        fprintf(stderr,"ERROR NCCL 2.7 or newer is required.\n");
         NCCL_CALL(ncclCommDestroy(nccl_comm));
         MPI_CALL(MPI_Finalize());
         return 1;
@@ -290,10 +290,21 @@ int main(int argc, char* argv[]) {
     launch_initialize_boundaries(a, a_new, PI, iy_start_global - 1, nx, (chunk_size + 2), ny);
     CUDA_RT_CALL(cudaDeviceSynchronize());
 
+    int leastPriority = 0;
+    int greatestPriority = leastPriority;
+    CUDA_RT_CALL(cudaDeviceGetStreamPriorityRange(&leastPriority, &greatestPriority));
     cudaStream_t compute_stream;
-    CUDA_RT_CALL(cudaStreamCreate(&compute_stream));
-    cudaEvent_t compute_done;
-    CUDA_RT_CALL(cudaEventCreateWithFlags(&compute_done, cudaEventDisableTiming));
+    CUDA_RT_CALL(cudaStreamCreateWithPriority(&compute_stream, cudaStreamDefault, leastPriority));
+    cudaStream_t push_stream;
+    CUDA_RT_CALL(
+        cudaStreamCreateWithPriority(&push_stream, cudaStreamDefault, greatestPriority));
+
+    cudaEvent_t push_prep_done;
+    CUDA_RT_CALL(cudaEventCreateWithFlags(&push_prep_done, cudaEventDisableTiming));
+    cudaEvent_t push_done;
+    CUDA_RT_CALL(cudaEventCreateWithFlags(&push_done, cudaEventDisableTiming));
+    cudaEvent_t reset_l2norm_done;
+    CUDA_RT_CALL(cudaEventCreateWithFlags(&reset_l2norm_done, cudaEventDisableTiming));
 
     real* l2_norm_d;
     CUDA_RT_CALL(cudaMalloc(&l2_norm_d, sizeof(real)));
@@ -325,23 +336,30 @@ int main(int argc, char* argv[]) {
     }
 
     int iter = 0;
+    bool calculate_norm = true;
     real l2_norm = 1.0;
-    bool calculate_norm = true; // boolean to store whether l2 norm will be calculated in
-                                // an iteration or not
 
     MPI_CALL(MPI_Barrier(MPI_COMM_WORLD));
     double start = MPI_Wtime();
     PUSH_RANGE("Jacobi solve", 0)
     while (l2_norm > tol && iter < iter_max) {
         CUDA_RT_CALL(cudaMemsetAsync(l2_norm_d, 0, sizeof(real), compute_stream));
+        CUDA_RT_CALL(cudaEventRecord(reset_l2norm_done, compute_stream));
 
+        CUDA_RT_CALL(cudaStreamWaitEvent(push_stream, reset_l2norm_done, 0));
         calculate_norm = (iter % nccheck) == 0 || (!csv && (iter % 100) == 0);
+        launch_jacobi_kernel(a_new, a, l2_norm_d, iy_start, (iy_start + 1), nx, calculate_norm,
+                             push_stream);
 
-        launch_jacobi_kernel(a_new, a, l2_norm_d, iy_start, iy_end, nx, calculate_norm,
+        launch_jacobi_kernel(a_new, a, l2_norm_d, (iy_end - 1), iy_end, nx, calculate_norm,
+                             push_stream);
+        CUDA_RT_CALL(cudaEventRecord(push_prep_done, push_stream));
+
+        launch_jacobi_kernel(a_new, a, l2_norm_d, (iy_start + 1), (iy_end - 1), nx, calculate_norm,
                              compute_stream);
-        CUDA_RT_CALL(cudaEventRecord(compute_done, compute_stream));
 
         if (calculate_norm) {
+            CUDA_RT_CALL(cudaStreamWaitEvent(compute_stream, push_prep_done, 0));
             CUDA_RT_CALL(cudaMemcpyAsync(l2_norm_h, l2_norm_d, sizeof(real), cudaMemcpyDeviceToHost,
                                          compute_stream));
         }
@@ -352,11 +370,12 @@ int main(int argc, char* argv[]) {
         // Apply periodic boundary conditions
         PUSH_RANGE("NCCL_LAUNCH", 5)
         NCCL_CALL(ncclGroupStart());
-        NCCL_CALL(ncclRecv(a_new,                     nx, NCCL_REAL_TYPE, top,    nccl_comm, compute_stream));
-        NCCL_CALL(ncclSend(a_new + (iy_end - 1) * nx, nx, NCCL_REAL_TYPE, bottom, nccl_comm, compute_stream));
-        NCCL_CALL(ncclRecv(a_new + (iy_end * nx),     nx, NCCL_REAL_TYPE, bottom, nccl_comm, compute_stream));
-        NCCL_CALL(ncclSend(a_new + iy_start * nx,     nx, NCCL_REAL_TYPE, top,    nccl_comm, compute_stream));
+        NCCL_CALL(ncclRecv(a_new,                     nx, NCCL_REAL_TYPE, top,    nccl_comm, push_stream));
+        NCCL_CALL(ncclSend(a_new + (iy_end - 1) * nx, nx, NCCL_REAL_TYPE, bottom, nccl_comm, push_stream));
+        NCCL_CALL(ncclRecv(a_new + (iy_end * nx),     nx, NCCL_REAL_TYPE, bottom, nccl_comm, push_stream));
+        NCCL_CALL(ncclSend(a_new + iy_start * nx,     nx, NCCL_REAL_TYPE, top,    nccl_comm, push_stream));
         NCCL_CALL(ncclGroupEnd());
+        CUDA_RT_CALL(cudaEventRecord(push_done, push_stream));
         POP_RANGE
 
         if (calculate_norm) {
@@ -368,6 +387,7 @@ int main(int argc, char* argv[]) {
                 printf("%5d, %0.6f\n", iter, l2_norm);
             }
         }
+        CUDA_RT_CALL(cudaStreamWaitEvent(compute_stream, push_done, 0));
 
         std::swap(a_new, a);
         iter++;
@@ -400,7 +420,7 @@ int main(int argc, char* argv[]) {
 
     if (rank == 0 && result_correct) {
         if (csv) {
-            printf("nccl, %d, %d, %d, %d, %d, 1, %f, %f\n", nx, ny, iter_max, nccheck, size,
+            printf("nccl_overlap, %d, %d, %d, %d, %d, 1, %f, %f\n", nx, ny, iter_max, nccheck, size,
                    (stop - start), runtime_serial);
         } else {
             printf("Num GPUs: %d.\n", size);
@@ -411,7 +431,10 @@ int main(int argc, char* argv[]) {
                 runtime_serial / (size * (stop - start)) * 100);
         }
     }
-    CUDA_RT_CALL(cudaEventDestroy(compute_done));
+    CUDA_RT_CALL(cudaEventDestroy(reset_l2norm_done));
+    CUDA_RT_CALL(cudaEventDestroy(push_done));
+    CUDA_RT_CALL(cudaEventDestroy(push_prep_done));
+    CUDA_RT_CALL(cudaStreamDestroy(push_stream));
     CUDA_RT_CALL(cudaStreamDestroy(compute_stream));
 
     CUDA_RT_CALL(cudaFreeHost(l2_norm_h));
@@ -488,8 +511,8 @@ double single_gpu(const int nx, const int ny, const int iter_max, real* const a_
             iter_max, ny, nx, nccheck);
 
     int iter = 0;
-    real l2_norm = 1.0;
     bool calculate_norm = true;
+    real l2_norm = 1.0;
 
     double start = MPI_Wtime();
     PUSH_RANGE("Jacobi solve", 0)
