@@ -24,9 +24,9 @@ Before running this lab, ensure you have:
 
 ### 1. Source the Environment
 ```bash
-source $PROJECT_training2537/env.sh
+# If you haven't, load the environment
+source </path/to/this/repo>/env.sh # Make sure this example env is populated correctly.
 ```
-
 This script sets up the necessary environment variables for:
 - CUDA paths
 - NCCL library paths

@@ -20,8 +20,8 @@ This lab demonstrates the basics of using **NVSHMEM** for distributed GPU progra
 Before compiling and running, make sure to load the required modules and set up your environment. For example:
 
 ```bash
-# If you haven't, load the environment 
-source $PROJECT_training2537/env.sh
+# If you haven't, load the environment
+source </path/to/this/repo>/env.sh # Make sure this example env is populated correctly.
 ```
 
 ## Building and Running
