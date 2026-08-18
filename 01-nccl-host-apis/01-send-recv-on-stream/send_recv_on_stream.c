@@ -1,0 +1,134 @@
+/* Copyright (c) 2025 NVIDIA CORPORATION. All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ *  * Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ *  * Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ *  * Neither the name of NVIDIA CORPORATION nor the names of its
+ *    contributors may be used to endorse or promote products derived
+ *    from this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ``AS IS'' AND ANY
+ * EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+ * PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
+ * CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+ * EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+ * PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+ * PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
+ * OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
+#include <cuda_runtime.h>
+#include <mpi.h>
+#include <nccl.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+#define N 16
+
+#define CUDA_CHECK(stmt)                                                       \
+  do {                                                                         \
+    cudaError_t result = (stmt);                                               \
+    if (cudaSuccess != result) {                                               \
+      fprintf(stderr, "[%s:%d] CUDA failed with %s \n", __FILE__, __LINE__,    \
+              cudaGetErrorString(result));                                     \
+      exit(-1);                                                                \
+    }                                                                          \
+  } while (0)
+
+#define NCCL_CALL(call)                                                        \
+  {                                                                            \
+    ncclResult_t ncclStatus = call;                                            \
+    if (ncclSuccess != ncclStatus) {                                           \
+      fprintf(stderr,                                                          \
+              "ERROR: NCCL call \"%s\" in line %d of file %s failed "          \
+              "with "                                                          \
+              "%s (%d).\n",                                                    \
+              #call, __LINE__, __FILE__, ncclGetErrorString(ncclStatus),       \
+              ncclStatus);                                                     \
+      exit(ncclStatus);                                                        \
+    }                                                                          \
+  }
+int main(int argc, char *argv[]) {
+  MPI_Init(&argc, &argv);
+
+  int size, rank;
+  int h_send[N] = {0};
+  MPI_Comm_size(MPI_COMM_WORLD, &size);
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+
+  if (size != 2) {
+    if (rank == 0)
+      printf("This example requires 2 ranks\n");
+    MPI_Finalize();
+    return -1;
+  }
+
+  ncclUniqueId nccl_uid;
+  if (rank == 0)
+    NCCL_CALL(ncclGetUniqueId(&nccl_uid));
+  MPI_Bcast(&nccl_uid, sizeof(ncclUniqueId), MPI_BYTE, 0, MPI_COMM_WORLD);
+
+  int deviceC = 0;
+  CUDA_CHECK(cudaGetDeviceCount(&deviceC));
+  MPI_Comm local_comm;
+  MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, rank, MPI_INFO_NULL,
+                      &local_comm);
+  int local_rank;
+  MPI_Comm_rank(local_comm, &local_rank);
+  MPI_Comm_free(&local_comm);
+  if (deviceC == 0 || (deviceC != 1 && local_rank >= deviceC)) {
+    fprintf(stderr, "rank %d has no visible GPU for local rank %d\n", rank,
+            local_rank);
+    MPI_Abort(MPI_COMM_WORLD, 1);
+  }
+  CUDA_CHECK(cudaSetDevice(deviceC == 1 ? 0 : local_rank));
+  printf("We see %d devices on rank %d\n", deviceC, rank);
+
+  ncclComm_t nccl_comm;
+  NCCL_CALL(ncclCommInitRank(&nccl_comm, size, nccl_uid, rank));
+
+  int *send_buf, *recv_buf;
+  CUDA_CHECK(cudaMalloc((void **)&send_buf, N * sizeof(int)));
+  CUDA_CHECK(cudaMalloc((void **)&recv_buf, N * sizeof(int)));
+
+  cudaStream_t stream;
+  CUDA_CHECK(cudaStreamCreate(&stream));
+
+  int h_recv[N] = {0};
+
+  if (rank == 0) {
+    for (int i = 0; i < N; ++i)
+      h_send[i] = i;
+    // TODO: Queue the host-to-device copy on stream.
+  }
+
+  if (rank == 0) {
+    // TODO: Queue ncclSend on stream.
+  } else if (rank == 1) {
+    // TODO: Queue ncclRecv on stream.
+  }
+
+  if (rank == 1) {
+    // TODO: Queue the device-to-host copy on stream.
+  }
+
+  // TODO: Synchronize stream after the copies and point-to-point operation are
+  // queued.
+  // TODO: Print and validate h_recv on rank 1.
+
+  CUDA_CHECK(cudaFree(send_buf));
+  CUDA_CHECK(cudaFree(recv_buf));
+  NCCL_CALL(ncclCommDestroy(nccl_comm));
+  CUDA_CHECK(cudaStreamDestroy(stream));
+
+  MPI_Finalize();
+  return 0;
+}
