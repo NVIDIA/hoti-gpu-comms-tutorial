@@ -1,134 +1,148 @@
 # GPU Communication Libraries for Accelerating HPC and AI Applications
 
-This repository accompanies the interactive HOTI 2025 tutorial on GPU communication libraries, covering NVIDIA Collective Communication Library (NCCL) and NVSHMEM (including Python bindings). It contains hands-on labs with ready-to-build examples and reference solutions.
+This repository contains the hands-on exercises for the HOTI 2026 GPU
+communications tutorial. The labs cover NCCL and NVSHMEM, from host-launched
+operations through device APIs, Python bindings, and fused applications.
 
-Links:
-- Tutorial homepage: [GPU Communication Libraries for Accelerating HPC and AI Applications @ HotI 2025](https://hoti.org/tutorials-nccl-nvshmem.html)
-- Video recording: [YouTube](https://www.youtube.com/watch?v=rlA5QreHekk&list=PLBM5Lly_T4yRGBFgforeMTDpjasC_PV7r&index=31)
+Each exercise has a plain-named starter and a matching `_SOLVED` reference,
+except the completed hello-world toolchain check. Start with the chapter README
+for context, then use the leaf README for the build command, launcher,
+expected result, and TODOs.
 
 ## Prerequisites
 
-- NVIDIA GPUs with CUDA support (Ampere or newer recommended)
-- CUDA Toolkit (12.x recommended)
-- MPI implementation (e.g., OpenMPI or MPICH)
-- NCCL installed and visible to your toolchain
-- NVSHMEM installed (for C/C++) and NVSHMEM Python runtime (for Python labs)
-- Python 3.9+ for NVSHMEM Python labs
+- Linux with NVIDIA GPUs, a CUDA Toolkit, and an MPI implementation with
+  `mpicxx` or `mpicc`.
+- NCCL and/or NVSHMEM installations matching the labs you plan to run.
+- An MPI launcher configuration that assigns one GPU to each local rank.
 
-## Environment Setup
+The basic exercises run on a normal multi-GPU CUDA/MPI system. Exact library
+versions, GPU count, topology, and Python environment vary by chapter. The
+NCCL ecosystem and application chapters have additional requirements, so read
+the leaf README before building any lab.
 
-Set the following environment variables so the build system and runtime can find CUDA, NCCL, and NVSHMEM. The paths below are examples; adjust to your system.
+## Environment setup
 
-```bash
-export NVSHMEM_HOME=/path/to/nvshmem/build/lib
-export NCCL_HOME=/path/to/nccl-src/build/
-export LD_LIBRARY_PATH=$NCCL_HOME/lib:$NVSHMEM_HOME/lib:$LD_LIBRARY_PATH
-export PATH=$NVSHMEM_HOME/bin:$PATH
-export CPATH=$NCCL_HOME/build:$NVSHMEM_HOME/include:$CPATH
-```
-
-You may also need `CUDA_HOME` if not set by your environment modules:
+Set the install prefixes for the libraries used by the lab. `NCCL_HOME` and
+`NVSHMEM_HOME` must contain `include/` and `lib/`; a CUDA installation normally
+uses `include/` and `lib64/`.
 
 ```bash
 export CUDA_HOME=/usr/local/cuda
+export NCCL_HOME=/path/to/nccl-install
+export NVSHMEM_HOME=/path/to/nvshmem-install
+
+export PATH="$CUDA_HOME/bin:$NVSHMEM_HOME/bin:$PATH"
+export LD_LIBRARY_PATH="$CUDA_HOME/lib64:$NCCL_HOME/lib:$NVSHMEM_HOME/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 ```
 
-Verify your toolchain:
+`env.sh` contains the same template. Edit it for your system before sourcing
+it.
+
+Verify the tools first:
 
 ```bash
 nvcc --version
 mpicxx --version || mpicc --version
-python3 -V
+mpirun --version
+python3 -V  # Chapter 6 only
 ```
 
-## Repository Structure
+## Jupiter launch
 
+The tutorial systems are Jupiter Booster GH200 nodes, so CUDA device code in
+the Makefile-based labs defaults to `CUDA_ARCH=90`. Request one GPU per Slurm
+task. Slurm then exposes each task's assigned GPU as CUDA device 0; the labs
+handle that convention as well as a local launch where all GPUs are visible.
+
+~~~bash
+salloc -p booster --nodes=1 --ntasks=2 --gpus-per-task=1
+
+cd 01-nccl-host-apis/01-send-recv-on-stream
+make
+make run_SOLVED LAUNCHER='srun --ntasks=2 --gpus-per-task=1'
+~~~
+
+Every Makefile that launches multiple PEs accepts a complete `LAUNCHER`
+override. Do not set a global `CUDA_VISIBLE_DEVICES=0,1` in this Slurm form:
+Slurm supplies a separate one-GPU mask to each rank. For a local workstation,
+leave GPU visibility unset or set `CUDA_VISIBLE_DEVICES` explicitly and use
+the Makefile's default launcher.
+
+## How the labs work
+
+Start by verifying CUDA and MPI with the completed hello-world exercise:
+
+```bash
+cd 00-intro/00-hello-world
+make
+make run
 ```
-nccl/
-  lab1/     # NCCL basics (unsolved + solved)
-  lab3/     # Jacobi with NCCL (unsolved + solved)
-  lab5/     # NCCL symmetric memory kernels (unsolved + solved)
-nvshmem/
-  lab2/     # NVSHMEM basics (C++/CUDA - unsolved + solved)
-  lab4/     # Jacobi with NVSHMEM (unsolved + solved)
-  lab6/     # NVSHMEM Python bindings (put, put_signal)
+
+Then use the same build/run workflow in the coding labs. The first NCCL
+exercise uses:
+
+```bash
+cd 01-nccl-host-apis/01-send-recv-on-stream
+make
+make run_SOLVED
+make run  # after completing the starter
 ```
 
-Each lab includes a `Makefile` with standard targets to build and run.
+Run the solved version first to validate the environment, then fill in the
+starter and use `make run`. C/CUDA Makefiles use a complete `LAUNCHER`
+variable; some also expose `NP`, `CUDA_VISIBLE_DEVICES`, or architecture
+variables. Use the leaf README and Makefile for the values supported by that
+lab.
 
-## Building and Running
+Chapter 6 installs the public Python dependencies through its leaf Makefiles.
+The NCCL4Py and device-DSL labs build against the public
+[NCCL4Py source](https://github.com/NVIDIA/nccl/tree/master/bindings/nccl4py)
+specified by `NCCL4PY_SOURCE`; their leaf READMEs show the complete setup.
+Chapters 7 and 8 have specialized build steps; follow their local READMEs.
 
-Unless noted, the examples assume 2–4 GPUs on a single node. Control the number of MPI processes with `NP` and the visible GPUs with `CUDA_VISIBLE_DEVICES`.
+## Tutorial layout
 
-### NCCL Labs
+| Chapter | Topic | Exercises |
+| --- | --- | --- |
+| 0 | Introduction | Hello world toolchain check |
+| 1 | NCCL host APIs | Send/receive on a stream; all-reduce on a stream |
+| 2 | NVSHMEM RMA | Host put; device put; `nvshmem_ptr` |
+| 3 | Memory semantics | Put + barrier; put + quiet + signal/wait; put-signal |
+| 4 | Advanced NCCL features | Register symmetric memory; host PUT with symmetric operands |
+| 5 | NCCL device APIs | LSA device API; GIN put device API |
+| 6 | Python APIs | NVSHMEM4Py; NCCL4Py; Python device-API DSL |
+| 7 | NCCL contrib and Extensions | Use NCCL EP |
+| 8 | Applications | Jacobi solver; fused GEMM + all-reduce |
 
-- `nccl/lab3` (Jacobi):
-  ```bash
-  cd nccl/lab3
-  make jacobi              # build unsolved version
-  make jacobi_solved       # build reference solution
-  make run                 # run unsolved (default NP=4)
-  make run_solved          # run solved (default NP=4)
-  ```
+The directory names follow the same order:
 
-- `nccl/lab5` (Symmetric kernels):
-  ```bash
-  cd nccl/lab5
-  make nccl_symmetric            # build unsolved
-  make nccl_symmetric_solved     # build reference solution
-  make run                       # run unsolved (default NP=4)
-  make run_solved                # run solved (default NP=4)
-  ```
+```text
+00-intro/
+01-nccl-host-apis/
+02-nvshmem-rma/
+03-memory-semantics/
+04-advanced-nccl-features/
+05-nccl-device-apis/
+06-python-apis/
+07-nccl-contrib/
+08-applications/
+```
 
-### NVSHMEM Labs (C++/CUDA)
-
-- `nvshmem/lab2` (Basics):
-  ```bash
-  cd nvshmem/lab2
-  make               # build
-  make run           # run (default NP=4)
-  ```
-
-- `nvshmem/lab4` (Jacobi):
-  ```bash
-  cd nvshmem/lab4
-  make jacobi            # build unsolved
-  make jacobi_solved     # build reference solution
-  make run               # run unsolved (default NP=1 unless NP is set)
-  make run_solved        # run solved
-  ```
-
-### NVSHMEM Python Labs
-
-- `nvshmem/lab6`:
-  - Install Python dependencies:
-    ```bash
-    cd nvshmem/lab6
-    pip install -r requirements.txt
-    ```
-  - Run the Python example with two processes on two GPUs:
-    ```bash
-    make run   # runs: CUDA_VISIBLE_DEVICES=0,1 $(JSC_SUBMIT_CMD) -n 2 python3 put_signal.py
-    ```
-
-Notes:
-- Some Makefiles rely on `JSC_SUBMIT_CMD` (cluster launcher wrapper). This is because the tutorial was hosted using hardware from Forschungszentrum Jülich (JSC). On a workstation, you can set `JSC_SUBMIT_CMD` to `mpirun` or `srun` as appropriate, e.g.:
-  ```bash
-  export JSC_SUBMIT_CMD=mpirun
-  ```
-- You can override `NP` at invocation time: `NP=8 make run`.
+`common/nvshmem_exercise.h` supplies shared CUDA, MPI, and NVSHMEM setup for
+the NVSHMEM RMA and memory-semantics exercises.
 
 ## Troubleshooting
 
-- Ensure `LD_LIBRARY_PATH` contains both CUDA, NCCL, and NVSHMEM `lib` directories.
-- If `NVSHMEM_HOME` is required by a Makefile, confirm it is set and points to a valid install.
-- Match `NP` to the number of GPUs specified by `CUDA_VISIBLE_DEVICES`.
-- For NVSHMEM Python, verify that `libnvidia-nvshmem-cu12` and `cuda-python` versions are compatible with your CUDA driver/runtime.
+- If a compiler or linker cannot find NCCL or NVSHMEM, check that `NCCL_HOME`
+  and `NVSHMEM_HOME` name installation prefixes, then check `LD_LIBRARY_PATH`.
+- Match the MPI process count to the visible GPUs. The leaf README specifies
+  the expected rank count and any required topology.
+- Set the architecture variable documented by the leaf Makefile when its
+  default does not match your GPU.
+- A `SKIP` result in an `nvshmem_ptr`, NCCL window, or NCCL device-API lab can
+  be a valid capability report. Read the printed reason and the leaf README.
+- Keep the Python packages, CUDA, driver, and `nccl.core` installation
+  compatible for Chapter 6.
 
-## Credits and Attribution
-
-This material was presented as an interactive tutorial at Hot Interconnects 2025 (HOTI 2025):
-- Tutorial homepage: [hoti.org/tutorials-nccl-nvshmem.html](https://hoti.org/tutorials-nccl-nvshmem.html)
-- Recording: [YouTube](https://www.youtube.com/watch?v=rlA5QreHekk&list=PLBM5Lly_T4yRGBFgforeMTDpjasC_PV7r&index=31)
-
-This tutorial was co-hosted by NVIDIA and Forschungszentrum Jülich (JSC). JSC supported the workshop by supplying hardware access for participants. 
+For system-specific commands, use the leaf README.
