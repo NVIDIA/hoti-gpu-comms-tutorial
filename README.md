@@ -23,21 +23,20 @@ the leaf README before building any lab.
 
 ## Environment setup
 
-Set the install prefixes for the libraries used by the lab. `NCCL_HOME` and
-`NVSHMEM_HOME` must contain `include/` and `lib/`; a CUDA installation normally
-uses `include/` and `lib64/`.
+On JUPITER, source the included environment before building or launching a lab:
 
 ```bash
-export CUDA_HOME=/usr/local/cuda
-export NCCL_HOME=/path/to/nccl-install
-export NVSHMEM_HOME=/path/to/nvshmem-install
-
-export PATH="$CUDA_HOME/bin:$NVSHMEM_HOME/bin:$PATH"
-export LD_LIBRARY_PATH="$CUDA_HOME/lib64:$NCCL_HOME/lib:$NVSHMEM_HOME/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+source ./env.sh
 ```
 
-`env.sh` contains the same template. Edit it for your system before sourcing
-it.
+It loads the JUPITER Booster module stack and selects the project-built NCCL
+and NVSHMEM installations. The NVSHMEM setup uses MPI bootstrap and forces
+IBRC for remote PEs. Override the project defaults by setting `HOTI_ROOT`,
+`HOTI_CUDA_HOME`, `HOTI_NCCL_HOME`, or `HOTI_NVSHMEM_HOME` before sourcing the
+script.
+
+For another system, set `CUDA_HOME`, `NCCL_HOME`, and `NVSHMEM_HOME` to
+installations containing the required `include/` and library directories.
 
 Verify the tools first:
 

@@ -214,11 +214,10 @@ def main():  # noqa: C901 — kept as a single function to mirror ep_test.cu
             print(f"Error: top_k ({top_k}) must be <= num_local_experts ({num_local_experts})")
         sys.exit(1)
 
-    # Local rank = rank within the per-node sub-communicator.
     local_comm = mpi_comm.Split_type(MPI.COMM_TYPE_SHARED)
     local_rank = local_comm.Get_rank()
-
-    device = Device(0 if system.get_num_devices() == 1 else local_rank)
+    device_id = 0 if system.get_num_devices() == 1 else local_rank % system.get_num_devices()
+    device = Device(device_id)
     device.set_current()
     stream = device.create_stream()
 

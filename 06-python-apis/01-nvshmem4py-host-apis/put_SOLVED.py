@@ -36,15 +36,16 @@ Using NVSHMEM to do one-sided RMA
 import numpy as np
 import nvshmem.core
 from cuda.core import Device, system
-import os
 
 from mpi4py import MPI
 
 def mpi_init():
     # This uses the MPI communicator to perform initialization of NVSHMEM
-    local_rank_per_node = MPI.COMM_WORLD.Get_rank() % system.get_num_devices()
     global dev
-    dev = Device(local_rank_per_node)
+    local_comm = MPI.COMM_WORLD.Split_type(MPI.COMM_TYPE_SHARED)
+    local_rank = local_comm.Get_rank()
+    device_id = 0 if system.get_num_devices() == 1 else local_rank % system.get_num_devices()
+    dev = Device(device_id)
     dev.set_current()
     nvshmem.core.init(device=dev, mpi_comm=MPI.COMM_WORLD, initializer_method="mpi")
 

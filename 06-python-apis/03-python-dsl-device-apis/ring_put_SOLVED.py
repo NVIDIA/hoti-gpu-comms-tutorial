@@ -73,7 +73,10 @@ def main():
             print("ERROR: this exercise requires a visible CUDA device")
         return 1
 
-    device = Device(rank % system.get_num_devices())
+    local_comm = mpi_comm.Split_type(MPI.COMM_TYPE_SHARED)
+    local_rank = local_comm.Get_rank()
+    device_id = 0 if system.get_num_devices() == 1 else local_rank % system.get_num_devices()
+    device = Device(device_id)
     device.set_current()
 
     unique_id = nccl.get_unique_id() if rank == 0 else None

@@ -39,7 +39,11 @@ def main():
             print("ERROR: this exercise requires a visible CUDA device")
         return 1
 
-    device = torch.device(f"cuda:{rank % torch.cuda.device_count()}")
+    local_comm = mpi_comm.Split_type(MPI.COMM_TYPE_SHARED)
+    local_rank = local_comm.Get_rank()
+    device_count = torch.cuda.device_count()
+    device_index = 0 if device_count == 1 else local_rank % device_count
+    device = torch.device(f"cuda:{device_index}")
     torch.cuda.set_device(device)
 
     unique_id = nccl.get_unique_id() if rank == 0 else None

@@ -42,8 +42,10 @@ import nvshmem.core
 
 
 def mpi_init():
-    local_rank_per_node = MPI.COMM_WORLD.Get_rank() % system.get_num_devices()
-    device = Device(local_rank_per_node)
+    local_comm = MPI.COMM_WORLD.Split_type(MPI.COMM_TYPE_SHARED)
+    local_rank = local_comm.Get_rank()
+    device_id = 0 if system.get_num_devices() == 1 else local_rank % system.get_num_devices()
+    device = Device(device_id)
     device.set_current()
     nvshmem.core.init(device=device, mpi_comm=MPI.COMM_WORLD, initializer_method="mpi")
     return device

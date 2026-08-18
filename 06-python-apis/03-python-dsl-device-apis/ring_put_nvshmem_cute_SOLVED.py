@@ -47,7 +47,10 @@ def main():
             print("ERROR: this example requires a visible CUDA device")
         return 1
 
-    device = Device(rank % system.get_num_devices())
+    local_comm = mpi_comm.Split_type(MPI.COMM_TYPE_SHARED)
+    local_rank = local_comm.Get_rank()
+    device_id = 0 if system.get_num_devices() == 1 else local_rank % system.get_num_devices()
+    device = Device(device_id)
     device.set_current()
     nvshmem.core.init(mpi_comm=mpi_comm, initializer_method="mpi")
 
@@ -60,7 +63,7 @@ def main():
 
     bitcode = nvshmem.core.find_device_bitcode_library()
     compiled = cute.compile(ring_put, tensor_cute, options=f" --link-libraries={bitcode}")
-    compiled = compiled.to(Device().device_id)
+    compiled = compiled.to(device.device_id)
     cuda_library = compiled.jit_module.cuda_library
     kernel = nvshmem.core.NvshmemKernelObject.from_handle(int(cuda_library[0]))
     nvshmem.core.library_init(kernel)
