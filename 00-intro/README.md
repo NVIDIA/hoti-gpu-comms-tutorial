@@ -51,7 +51,8 @@ the LSA pointer path separately from the GIN put/signal/wait path.
 6. **Python APIs** — NVSHMEM4Py, NCCL4Py, and Python DSL device APIs.
 7. **NCCL contrib and Extensions** — the surrounding ecosystem and an NCCL EP
    exercise.
-8. **Applications** — a Jacobi solver and fused GEMM plus all-reduce kernel.
+8. **Applications** — a Jacobi solver and NVSHMEM/NCCL versions of a fused
+   GEMM plus all-reduce kernel.
 
 Most exercise directories contain a starter with the plain filename and a
 checked reference with `_SOLVED` in its name. Hello world is deliberately

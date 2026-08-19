@@ -1,7 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 if command -v module >/dev/null 2>&1; then
-  module load Stages/2026 GCC/14.3.0 CMake/3.31.8 CUDA/13 OpenMPI/5.0.8
+  module load Stages/2026 GCC/14.3.0 CUDA/13 OpenMPI/5.0.8
 fi
 
 export HOTI_ROOT="${HOTI_ROOT:-/e/project1/training2633}"

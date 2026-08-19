@@ -112,7 +112,7 @@ Chapters 7 and 8 have specialized build steps; follow their local READMEs.
 | 5 | NCCL device APIs | LSA device API; GIN put device API |
 | 6 | Python APIs | NVSHMEM4Py; NCCL4Py; Python device-API DSL |
 | 7 | NCCL contrib and Extensions | Use NCCL EP |
-| 8 | Applications | Jacobi solver; fused GEMM + all-reduce |
+| 8 | Applications | Jacobi solver; fused GEMM + all-reduce with NVSHMEM and NCCL LSA |
 
 The directory names follow the same order:
 
@@ -130,6 +130,9 @@ The directory names follow the same order:
 
 `common/nvshmem_exercise.h` supplies shared CUDA, MPI, and NVSHMEM setup for
 the NVSHMEM RMA and memory-semantics exercises.
+`05-nccl-device-apis/device_api_common.hpp` supplies the NCCL communicator,
+symmetric-window, and device-communicator setup reused by the NCCL fused-GEMM
+implementation.
 
 ## Troubleshooting
 
