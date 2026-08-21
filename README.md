@@ -23,7 +23,8 @@ the leaf README before building any lab.
 
 ## Environment setup
 
-On JUPITER, source the included environment before building or launching a lab:
+For a standalone JUPITER checkout, source the included environment before
+building or launching a lab:
 
 ```bash
 source ./env.sh
@@ -35,6 +36,20 @@ IBRC for remote PEs. Override the project defaults by setting `HOTI_ROOT`,
 `HOTI_CUDA_HOME`, `HOTI_NCCL_HOME`, or `HOTI_NVSHMEM_HOME` before sourcing the
 script.
 
+### HOTI course account on JUPITER
+
+Use the course environment and its synced material tree when you have a JSC
+HOTI account. Run these commands in an interactive SSH or Jupyter Terminal:
+
+```bash
+source "$PROJECT_training2633/env.sh"
+jsc-material-sync
+cd "$HOME/HotI26"
+```
+
+The course environment supplies `JSC_SUBMIT_CMD`; Makefile run targets honor
+it automatically and submit through the Booster course allocation.
+
 For another system, set `CUDA_HOME`, `NCCL_HOME`, and `NVSHMEM_HOME` to
 installations containing the required `include/` and library directories.
 
@@ -44,7 +59,7 @@ Verify the tools first:
 nvcc --version
 mpicxx --version || mpicc --version
 mpirun --version
-python3 -V  # Chapter 6 only
+python3 -V  # Chapter 7 only
 ```
 
 ## Jupiter launch
@@ -73,7 +88,7 @@ the Makefile's default launcher.
 Start by verifying CUDA and MPI with the completed hello-world exercise:
 
 ```bash
-cd 00-intro/00-hello-world
+cd 00-hello-world
 make
 make run
 ```
@@ -94,42 +109,45 @@ variable; some also expose `NP`, `CUDA_VISIBLE_DEVICES`, or architecture
 variables. Use the leaf README and Makefile for the values supported by that
 lab.
 
-Chapter 6 installs the public Python dependencies through its leaf Makefiles.
+Chapter 7 installs the public Python dependencies through its leaf Makefiles.
 The NCCL4Py and device-DSL labs build against the public
 [NCCL4Py source](https://github.com/NVIDIA/nccl/tree/master/bindings/nccl4py)
 specified by `NCCL4PY_SOURCE`; their leaf READMEs show the complete setup.
-Chapters 7 and 8 have specialized build steps; follow their local READMEs.
+Chapters 6 and 8 have specialized build steps; follow their local READMEs.
 
 ## Tutorial layout
 
 | Chapter | Topic | Exercises |
 | --- | --- | --- |
-| 0 | Introduction | Hello world toolchain check |
+| 0 | Hello world | CUDA/MPI toolchain check |
 | 1 | NCCL host APIs | Send/receive on a stream; all-reduce on a stream |
 | 2 | NVSHMEM RMA | Host put; device put; `nvshmem_ptr` |
-| 3 | Memory semantics | Put + barrier; put + quiet + signal/wait; put-signal |
-| 4 | Advanced NCCL features | Register symmetric memory; host PUT with symmetric operands |
+| 3 | NCCL symmetric memory | Register symmetric memory; host PUT with symmetric operands |
+| 4 | Memory model | Put + barrier; put + quiet + signal/wait; put-signal |
 | 5 | NCCL device APIs | LSA device API; GIN put device API |
-| 6 | Python APIs | NVSHMEM4Py; NCCL4Py; Python device-API DSL |
-| 7 | NCCL contrib and Extensions | Use NCCL EP |
-| 8 | Applications | Jacobi solver; fused GEMM + all-reduce |
+| 6 | Applications | Jacobi solver; fused GEMM + all-reduce with NVSHMEM and NCCL LSA |
+| 7 | Python APIs | NVSHMEM4Py; NCCL4Py; Python device-API DSL |
+| 8 | NCCL contrib and Extensions | Use NCCL EP |
 
 The directory names follow the same order:
 
 ```text
-00-intro/
+00-hello-world/
 01-nccl-host-apis/
 02-nvshmem-rma/
-03-memory-semantics/
-04-advanced-nccl-features/
+03-nccl-symmetric/
+04-memory-model/
 05-nccl-device-apis/
-06-python-apis/
-07-nccl-contrib/
-08-applications/
+06-applications/
+07-python-apis/
+08-nccl-contrib/
 ```
 
 `common/nvshmem_exercise.h` supplies shared CUDA, MPI, and NVSHMEM setup for
-the NVSHMEM RMA and memory-semantics exercises.
+the NVSHMEM RMA and memory-model exercises.
+`05-nccl-device-apis/device_api_common.hpp` supplies the NCCL communicator,
+symmetric-window, and device-communicator setup reused by the NCCL fused-GEMM
+implementation.
 
 ## Troubleshooting
 
@@ -142,6 +160,6 @@ the NVSHMEM RMA and memory-semantics exercises.
 - A `SKIP` result in an `nvshmem_ptr`, NCCL window, or NCCL device-API lab can
   be a valid capability report. Read the printed reason and the leaf README.
 - Keep the Python packages, CUDA, driver, and `nccl.core` installation
-  compatible for Chapter 6.
+compatible for Chapter 7.
 
 For system-specific commands, use the leaf README.

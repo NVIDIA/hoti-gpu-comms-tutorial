@@ -1,6 +1,7 @@
 PYTHON ?= python3
 MPIEXEC ?= mpirun
-LAUNCHER ?= $(MPIEXEC) -np $(NP)
+JSC_SUBMIT_CMD ?= $(MPIEXEC)
+LAUNCHER ?= $(JSC_SUBMIT_CMD) -n $(NP)
 MAKE_CMD ?= make
 NP ?= 4
 JOBS ?= 8

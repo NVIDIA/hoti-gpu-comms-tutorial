@@ -1,4 +1,4 @@
-# Memory semantics
+# Memory model
 
 One-sided communication moves data without a matching receive, but the target
 still needs a defined point at which device code may consume that data. This
@@ -80,10 +80,8 @@ make run LAUNCHER="srun --ntasks=2 --gpus-per-task=1"
   covers device collective participation and collective launch.
 
 NVSHMEM makes ordering, completion, and notification particularly easy to
-reason about because the API surface exposes them separately. NCCL has similar
-expressivity through registered symmetric windows, put-with-signal, stream
-ordering, and device APIs; it packages the setup and operations differently.
-The next two chapters apply the same ideas to NCCL: see
-[Advanced NCCL features](../04-advanced-nccl-features/) for windows and host
-RMA, then [NCCL device APIs](../05-nccl-device-apis/) for device
-communicators, LSA, and GIN.
+reason about because the API surface exposes them separately. The preceding
+[NCCL symmetric memory](../03-nccl-symmetric/) chapter uses registered
+windows, put-with-signal, and stream ordering to expose the same concerns
+through NCCL. The following [NCCL device APIs](../05-nccl-device-apis/) chapter
+applies them through device communicators, LSA, and GIN.

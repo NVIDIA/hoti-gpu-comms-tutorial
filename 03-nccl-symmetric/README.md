@@ -1,4 +1,4 @@
-# Advanced NCCL features
+# NCCL symmetric memory
 
 The host-API chapter uses a communicator plus ordinary device pointers. That is
 the right model for most `ncclAllReduce`, `ncclSend`, and `ncclRecv` calls. In
@@ -60,8 +60,8 @@ restrictions used by the exercise.
 
 ## Related chapters
 
-The [Memory semantics](../03-memory-semantics/) chapter introduced the
-ordering, completion, and notification questions through NVSHMEM. NCCL
+The [Memory model](../04-memory-model/) chapter follows this one and develops
+the ordering, completion, and notification questions through NVSHMEM. NCCL
 windows and `ncclPutSignal` express the same kind of handoff through a
 different API surface.
 

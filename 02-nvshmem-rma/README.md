@@ -45,7 +45,7 @@ queued after the RMA work on the same stream, so PE 1 can inspect its local
 target after its stream synchronizes. Real applications often use a smaller
 protocol, such as a signal and wait, rather than a global barrier.
 
-The [Memory semantics](../03-memory-semantics/) chapter uses the same
+The [Memory model](../04-memory-model/) chapter uses the same
 one-integer put with three handoff protocols: a barrier, `quiet` plus an
 explicit signal/wait, and `put_signal`. Read it when you want to separate
 initiator completion from target notification.
