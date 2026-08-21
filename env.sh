@@ -8,6 +8,7 @@ export HOTI_ROOT="${HOTI_ROOT:-/e/project1/training2633}"
 export CUDA_HOME="${HOTI_CUDA_HOME:-/e/software/default/stages/2026/software/CUDA/13}"
 export NCCL_HOME="${HOTI_NCCL_HOME:-$HOTI_ROOT/nvidia/install/nccl}"
 export NVSHMEM_HOME="${HOTI_NVSHMEM_HOME:-$HOTI_ROOT/nvidia/install/nvshmem}"
+export NCCL_EXTENSIONS_SRC="${NCCL_EXTENSIONS_SRC:-$HOTI_ROOT/nvidia/nccl-extensions}"
 
 export PATH="$CUDA_HOME/bin:$NVSHMEM_HOME/bin${PATH:+:$PATH}"
 export LD_LIBRARY_PATH="$NCCL_HOME/lib:$NVSHMEM_HOME/lib:$CUDA_HOME/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"

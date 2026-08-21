@@ -3,7 +3,8 @@
 PYTHON ?= python3
 MPIRUN ?= mpirun
 NP ?= 2
-LAUNCHER ?= $(MPIRUN) -np $(NP)
+JSC_SUBMIT_CMD ?= $(MPIRUN)
+LAUNCHER ?= $(JSC_SUBMIT_CMD) -n $(NP)
 NCCL4PY_SOURCE ?=
 NVIDIA_PYPI ?= https://pypi.nvidia.com
 CUDA_VISIBLE_DEVICES ?=

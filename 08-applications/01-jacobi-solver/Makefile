@@ -5,7 +5,8 @@ NVCC ?= nvcc
 MPICXX ?= mpicxx
 CUDA_ARCH ?= 90
 MPIRUN ?= mpirun
-LAUNCHER ?= $(MPIRUN) -np $(NP)
+JSC_SUBMIT_CMD ?= $(MPIRUN)
+LAUNCHER ?= $(JSC_SUBMIT_CMD) -n $(NP)
 RUN_ARGS ?=
 
 ifneq ($(MAKECMDGOALS),clean)

@@ -23,7 +23,8 @@ the leaf README before building any lab.
 
 ## Environment setup
 
-On JUPITER, source the included environment before building or launching a lab:
+For a standalone JUPITER checkout, source the included environment before
+building or launching a lab:
 
 ```bash
 source ./env.sh
@@ -34,6 +35,20 @@ and NVSHMEM installations. The NVSHMEM setup uses MPI bootstrap and forces
 IBRC for remote PEs. Override the project defaults by setting `HOTI_ROOT`,
 `HOTI_CUDA_HOME`, `HOTI_NCCL_HOME`, or `HOTI_NVSHMEM_HOME` before sourcing the
 script.
+
+### HOTI course account on JUPITER
+
+Use the course environment and its synced material tree when you have a JSC
+HOTI account. Run these commands in an interactive SSH or Jupyter Terminal:
+
+```bash
+source "$PROJECT_training2633/env.sh"
+jsc-material-sync
+cd "$HOME/HotI26"
+```
+
+The course environment supplies `JSC_SUBMIT_CMD`; Makefile run targets honor
+it automatically and submit through the Booster course allocation.
 
 For another system, set `CUDA_HOME`, `NCCL_HOME`, and `NVSHMEM_HOME` to
 installations containing the required `include/` and library directories.

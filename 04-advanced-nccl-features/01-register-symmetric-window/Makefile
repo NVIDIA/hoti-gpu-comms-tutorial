@@ -3,7 +3,8 @@
 NP ?= 4
 MPICXX ?= mpicxx
 MPIRUN ?= mpirun
-LAUNCHER ?= $(MPIRUN) -np $(NP)
+JSC_SUBMIT_CMD ?= $(MPIRUN)
+LAUNCHER ?= $(JSC_SUBMIT_CMD) -n $(NP)
 CUDA_HOME ?= /usr/local/cuda
 NCCL_HOME ?= /usr
 CUDA_VISIBLE_DEVICES ?=
