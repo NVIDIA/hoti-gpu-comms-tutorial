@@ -1,6 +1,6 @@
 # NCCL device APIs
 
-The [Advanced NCCL features](../04-advanced-nccl-features/) chapter registers
+The [NCCL symmetric memory](../03-nccl-symmetric/) chapter registers
 symmetric windows for host-side operations. This chapter uses that same
 registered-memory model from a CUDA kernel. The kernel does not create a
 communicator and it does not call host APIs. The host prepares a device
@@ -75,5 +75,5 @@ lists the CUDA, GPU, NIC, driver, and topology requirements. It also documents
 the cross-version limitation that GIN kernels need recompilation when NCCL is
 upgraded.
 
-The [Memory semantics](../03-memory-semantics/) chapter introduced the same
+The [Memory model](../04-memory-model/) chapter introduced the same
 ordering, completion, and notification questions through NVSHMEM.
