@@ -54,9 +54,9 @@ __global__ void fused_gemm_allreduce_nccl(const float *a, const float *b,
   result[index] = value;
   __syncthreads();
 
-  // TODO: Synchronize the LSA team after every rank has produced its tile.
-  // TODO: Sum this element from every rank's partial window into result, then
-  // synchronize the LSA team before the kernel returns.
+  // TODO: Use an LSA barrier after every rank has produced its tile.
+  // TODO: Sum this element through ncclGetPeerPointer from every world rank,
+  // then release the LSA barrier before the kernel returns.
   (void)dev_comm;
 #endif
 }

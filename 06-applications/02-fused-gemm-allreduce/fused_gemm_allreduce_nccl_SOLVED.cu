@@ -57,11 +57,11 @@ __global__ void fused_gemm_allreduce_nccl(const float *a, const float *b,
                                              dev_comm.lsaBarrier, blockIdx.x};
   barrier.sync(ncclCoopCta(), cuda::memory_order_acq_rel);
 
-  const ncclTeam lsa_team = ncclTeamLsa(dev_comm);
+  const ncclTeam world_team = ncclTeamWorld(dev_comm);
   float sum = 0.0f;
-  for (int peer = 0; peer < lsa_team.nRanks; ++peer) {
+  for (int peer = 0; peer < world_team.nRanks; ++peer) {
     const float *peer_partial =
-        static_cast<const float *>(ncclGetLsaPointer(partial_window, 0, peer));
+        static_cast<const float *>(ncclGetPeerPointer(partial_window, 0, peer));
     sum += peer_partial[index];
   }
   result[index] = sum;

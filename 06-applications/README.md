@@ -37,7 +37,8 @@ can communicate across the selected GPUs. The Makefile defaults to
 The fused GEMM example is a deliberately small version of the pattern. One
 CTA computes a 16x16 output tile. The NVSHMEM version exchanges tiles with a
 put-with-signal. The NCCL version publishes each tile in a symmetric window,
-uses an LSA barrier, and loads both tiles directly through LSA pointers.
+uses an LSA barrier, and loads both tiles directly through
+`ncclGetPeerPointer`.
 
 It is not intended as a tuned collective. It keeps the matrix small enough
 that the relationship between computation, communication, and completion is

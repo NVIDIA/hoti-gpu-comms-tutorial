@@ -109,21 +109,23 @@ reserved one LSA barrier for the single CTA.
    the barrier with `cuda::memory_order_acq_rel`. The release side publishes
    the local stores; the acquire side makes the peers' stores visible after
    all ranks arrive.
-3. Use `ncclTeamLsa(dev_comm)` and `ncclGetLsaPointer` to load this element
-   from every rank's partial window. Store the sum in the local result window.
+3. Iterate `ncclTeamWorld(dev_comm)` and use `ncclGetPeerPointer` to load this
+   element from every rank's partial window. The setup has already verified
+   that both world ranks are in the LSA team. Store the sum in the local result
+   window.
 4. Call the same barrier with `cuda::memory_order_release` before returning.
 
 The functions used in the kernel are:
 
 ~~~cpp
-ncclTeam ncclTeamLsa(ncclDevComm const &comm);
-// Return the communicator's load/store-accessible team.
+ncclTeam ncclTeamWorld(ncclDevComm const &comm);
+// Return the communicator's world team.
 
 void *ncclGetLocalPointer(ncclWindow_t window, size_t offset);
 // Return this rank's local address for a registered window.
 
-void *ncclGetLsaPointer(ncclWindow_t window, size_t offset, int peer);
-// Return an address that directly accesses peer's registered window.
+void *ncclGetPeerPointer(ncclWindow_t window, size_t offset, int peer);
+// Return an LSA address that directly accesses a world peer's registered window.
 
 barrier.sync(ncclCoopCta(), cuda::memory_order order);
 // Make every thread in the CTA participate in the cross-rank LSA barrier.
