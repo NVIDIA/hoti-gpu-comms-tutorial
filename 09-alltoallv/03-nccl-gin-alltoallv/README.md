@@ -146,7 +146,7 @@ it prints `SKIP`. A successful run ends with output like:
 NCCL topology: world=2, LSA=1, rail=2
 NCCL GIN AlltoAllV correctness: PASS
 NCCL GIN AlltoAllV performance: ... ms/iteration, ... GB/s logical non-self
-NCCL GIN AlltoAllV payload rates: 0.000 GB/s local, ... GB/s network
+NCCL GIN AlltoAllV placement payload rates: 0.000 GB/s same-host non-self, ... GB/s inter-host
 ```
 
 The reported bandwidth counts payload sent to other ranks and uses the

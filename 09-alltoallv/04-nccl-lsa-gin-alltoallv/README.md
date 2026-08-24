@@ -163,9 +163,10 @@ The program prints the discovered world, LSA, and rail sizes. It prints
 `SKIP` instead of guessing when the placement does not form uniform LSA and
 rail teams or when railed GIN is unavailable. A successful run reports both
 correctness and the slowest-rank iteration time. For a mixed run, use the
-separate network payload rate when comparing with the IB rails. The combined
-logical rate also includes local LSA traffic, while each remote byte incurs a
-pack copy and a scatter copy in addition to the network transfer.
+separate inter-host placement rate when comparing with the IB rails. This lab
+also verifies that each LSA team matches one host before it runs. The combined
+logical rate includes local LSA traffic, while each remote byte incurs a pack
+copy and a scatter copy in addition to the network transfer.
 
 This implementation uses ordinary Hopper-compatible loads, stores, and GIN
 operations. It does not require NVLS, multimem instructions, or a

@@ -141,8 +141,11 @@ progress. No source change is required.
 The two-node offdiagonal run should report `0 direct, 2 network`. The two-node,
 two-PE-per-node run should report `4 direct, 8 network`. Those counts verify
 the intended placement before interpreting the timing number. In a mixed run,
-the logical non-self rate includes both direct and network payload bytes; use
-the separate network payload rate for an InfiniBand comparison.
+the logical non-self rate includes both direct and network payload bytes. The
+placement breakdown separates same-host and inter-host bytes; confirm the
+actual route with the `NVSHMEM routes` line before treating inter-host bytes as
+InfiniBand traffic. Multi-node NVLink systems can map an inter-host peer
+directly.
 
 ## Exercise
 
@@ -196,11 +199,11 @@ NVSHMEM device plan: PASS
 NVSHMEM routes: ... direct, ... network
 NVSHMEM AlltoAllV correctness: PASS
 NVSHMEM AlltoAllV performance: ... ms/iteration, ... GB/s logical non-self
-NVSHMEM AlltoAllV payload rates: ... GB/s local, ... GB/s network
+NVSHMEM AlltoAllV placement payload rates: ... GB/s same-host non-self, ... GB/s inter-host
 ```
 
 This lab implements an out-of-place collective for 32-bit values. The route
 plan is rebuilt when the counts change, and the fixed chunk size is a tuning
 parameter rather than an automatic policy. The traffic summary and split
-payload rates show which part of a mixed result used a direct mapping and
-which part crossed the network.
+payload rates describe MPI rank placement. The route summary reports what
+`nvshmem_ptr` actually mapped directly and what used the network path.

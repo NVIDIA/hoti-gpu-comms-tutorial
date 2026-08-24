@@ -233,7 +233,8 @@ inline SetupResult prepare(State *state, int *argc, char ***argv,
               state->lsa_team.nRanks > 1 && state->rail_team.nRanks > 1 &&
               state->lsa_team.nRanks * state->rail_team.nRanks == state->size &&
               min_lsa_size == max_lsa_size &&
-              min_rail_size == max_rail_size;
+              min_rail_size == max_rail_size &&
+              state->lsa_team.rank == plan->local_ranks[state->rank];
   }
   int all_capable = 0;
   alltoallv::mpi_check(MPI_Allreduce(&capable, &all_capable, 1, MPI_INT,
@@ -246,8 +247,8 @@ inline SetupResult prepare(State *state, int *argc, char ***argv,
       print_skip(*state, "full GIN connectivity is unavailable");
     else
       print_skip(*state,
-                 "this placement does not provide uniform LSA teams and "
-                 "railed GIN across at least two nodes");
+                 "this placement does not provide aligned, uniform LSA "
+                 "teams and railed GIN across at least two nodes");
     return SetupResult::Skipped;
   }
 

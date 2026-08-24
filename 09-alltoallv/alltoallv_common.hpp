@@ -199,6 +199,13 @@ inline std::uint64_t make_offsets(const std::vector<std::uint64_t> &counts,
 
 inline std::vector<std::uint64_t>
 make_send_counts(int rank, int size, const Options &options) {
+  if (options.pattern == "offdiagonal" && size < 2) {
+    if (rank == 0)
+      std::fprintf(stderr,
+                   "--pattern offdiagonal requires at least two ranks\n");
+    MPI_Abort(MPI_COMM_WORLD, 1);
+    return {};
+  }
   std::vector<std::uint64_t> weights(size, 1);
   for (int peer = 0; peer < size; ++peer) {
     std::uint64_t hash = static_cast<std::uint64_t>(rank + 1) * 0x9e3779b1u +
@@ -269,7 +276,7 @@ inline Plan make_plan(int rank, int size, const Options &options) {
             "MPI_Comm_rank(placement)");
   mpi_check(MPI_Allreduce(&rank, &node_root, 1, MPI_INT, MPI_MIN, local_comm),
             "MPI_Allreduce(node root)");
-  MPI_Comm_free(&local_comm);
+  mpi_check(MPI_Comm_free(&local_comm), "MPI_Comm_free(placement)");
   plan.node_roots.resize(size);
   plan.local_ranks.resize(size);
   mpi_check(MPI_Allgather(&node_root, 1, MPI_INT, plan.node_roots.data(), 1,
@@ -456,15 +463,17 @@ inline void print_plan(const Plan &plan, const Options &options,
         static_cast<double>(sizeof(value_type)) /
         static_cast<double>(1ull << 20);
     std::printf(
-        "Traffic per iteration: self=%.3f MiB, local=%.3f MiB, "
-        "network=%.3f MiB, hybrid off-rail scatter=%.3f MiB\n",
+        "Placement traffic per iteration: self=%.3f MiB, "
+        "same-host non-self=%.3f MiB, inter-host=%.3f MiB, "
+        "inter-host to a different local rank=%.3f MiB\n",
         plan.global_self_elements * bytes_to_mib,
         plan.global_local_elements * bytes_to_mib,
         plan.global_network_elements * bytes_to_mib,
         plan.global_offrail_elements * bytes_to_mib);
-    std::printf("Hottest rank: network send=%.3f MiB, receive=%.3f MiB\n",
-                plan.max_network_send_elements * bytes_to_mib,
-                plan.max_network_recv_elements * bytes_to_mib);
+    std::printf(
+        "Per-rank inter-host maxima: send=%.3f MiB, receive=%.3f MiB\n",
+        plan.max_network_send_elements * bytes_to_mib,
+        plan.max_network_recv_elements * bytes_to_mib);
   }
 }
 
@@ -487,8 +496,10 @@ inline void report_timing(const Plan &plan, const Options &options,
   std::printf(
       "%s performance: %.3f ms/iteration, %.3f GB/s logical non-self\n",
       implementation, average_ms, aggregate_gbs);
-  std::printf("%s payload rates: %.3f GB/s local, %.3f GB/s network\n",
-              implementation, local_gbs, network_gbs);
+  std::printf(
+      "%s placement payload rates: %.3f GB/s same-host non-self, "
+      "%.3f GB/s inter-host\n",
+      implementation, local_gbs, network_gbs);
 }
 
 } // namespace alltoallv

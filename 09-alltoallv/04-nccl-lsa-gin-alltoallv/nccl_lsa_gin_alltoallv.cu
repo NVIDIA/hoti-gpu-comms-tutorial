@@ -82,6 +82,7 @@ __global__ void pack_and_deliver_local(
    *    receive window, rotating the first destination by lsa.rank.
    * 2. For every remote rail rank, write one HybridPacketItem per destination
    *    LSA rank and pack the corresponding payload into that outbox slot.
+   *    Rotate the first packed destination by lsa.rank as well.
    */
   (void)rail;
   (void)thread;
@@ -119,7 +120,8 @@ __global__ void exchange_rails_and_scatter(
    *    gin.put(rail, ...) and a weak signal indexed by the source rail rank.
    * 2. Wait until every remote source signal reaches epoch, then flush the
    *    issuing context.
-   * 3. Read each received packet and scatter its items through LSA pointers.
+   * 3. Read each received packet and scatter its items through LSA pointers,
+   *    rotating the first destination by lsa.rank.
    */
   (void)rail;
   (void)header_bytes;

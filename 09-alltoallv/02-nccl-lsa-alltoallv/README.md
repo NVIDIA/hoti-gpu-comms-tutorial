@@ -116,7 +116,7 @@ than attempting invalid peer accesses. A successful run ends with output like:
 NCCL topology: world=4, LSA=4, rail=1
 NCCL LSA AlltoAllV correctness: PASS
 NCCL LSA AlltoAllV performance: ... ms/iteration, ... GB/s logical non-self
-NCCL LSA AlltoAllV payload rates: ... GB/s local, 0.000 GB/s network
+NCCL LSA AlltoAllV placement payload rates: ... GB/s same-host non-self, 0.000 GB/s inter-host
 ```
 
 The reported bandwidth counts payload sent to other ranks and uses the

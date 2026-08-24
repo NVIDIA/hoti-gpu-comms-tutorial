@@ -89,18 +89,20 @@ isolating the network with one GPU per node. `skewed` is the default and gives
 one destination a much larger share. `sparse` includes zero-count pairs.
 
 The programs first validate one iteration, then time warm and measured
-iterations. The output separates self, same-node, and inter-node bytes. The
-main logical bandwidth is `(same-node + inter-node bytes) / slowest-rank
-time`; self copies are timed but are not in that numerator. The two payload
-rates use the same elapsed time and show the same-node and inter-node parts
+iterations. The output separates self, same-host, and inter-host bytes. The
+main logical bandwidth is `(same-host + inter-host bytes) / slowest-rank
+time`; self copies are timed but are not in that numerator. The two placement
+rates use the same elapsed time and show the same-host and inter-host parts
 separately.
 
-Use the inter-node payload rate for an IB comparison. The combined logical
-rate from a mixed NVLink-plus-IB run is not an IB bandwidth number. The hybrid
-algorithm also reads and writes every remote byte while packing, across the
-network, and again while scattering, so its minimum memory traffic is six
-bytes per remote logical byte. Those serialized copies can be the limit even
-when the rails are not full.
+Use the inter-host rate for an IB comparison only after confirming that the
+chosen ranks are in different NVLink domains. On a multi-node NVLink system,
+two hosts can still have a direct GPU mapping. The combined logical rate from
+a mixed NVLink-plus-IB run is not an IB bandwidth number. The hybrid algorithm
+also reads and writes every remote byte while packing, across the network, and
+again while scattering, so its minimum memory traffic is six bytes per remote
+logical byte. Those serialized copies can be the limit even when the rails are
+not full.
 
 The harness uses MPI only for bootstrap, metadata needed to construct the
 reference answer, error reduction, and benchmark alignment. MPI is not the
