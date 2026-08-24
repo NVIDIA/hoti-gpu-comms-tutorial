@@ -128,6 +128,7 @@ Chapters 6 and 8 have specialized build steps; follow their local READMEs.
 | 6 | Applications | Jacobi solver; fused GEMM + all-reduce with NVSHMEM and NCCL LSA |
 | 7 | Python APIs | NVSHMEM4Py; NCCL4Py; Python device-API DSL |
 | 8 | NCCL contrib and Extensions | Use NCCL EP |
+| 9 | Topology-aware AlltoAllV | NVSHMEM; NCCL LSA; NCCL GIN; NCCL LSA + railed GIN |
 
 The directory names follow the same order:
 
@@ -141,6 +142,7 @@ The directory names follow the same order:
 06-applications/
 07-python-apis/
 08-nccl-contrib/
+09-alltoallv/
 ```
 
 `common/nvshmem_exercise.h` supplies shared CUDA, MPI, and NVSHMEM setup for
@@ -148,6 +150,8 @@ the NVSHMEM RMA and memory-model exercises.
 `05-nccl-device-apis/device_api_common.hpp` supplies the NCCL communicator,
 symmetric-window, and device-communicator setup reused by the NCCL fused-GEMM
 implementation.
+`09-alltoallv/alltoallv_common.hpp` generates one irregular communication
+plan and validates it consistently across the NVSHMEM and NCCL versions.
 
 ## Troubleshooting
 

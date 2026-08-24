@@ -60,7 +60,13 @@ static inline void exercise_init(int *argc, char ***argv,
   MPI_Comm mpi_comm = MPI_COMM_WORLD;
   nvshmemx_init_attr_t attr = NVSHMEMX_INIT_ATTR_INITIALIZER;
   attr.mpi_comm = &mpi_comm;
-  nvshmemx_init_attr(NVSHMEMX_INIT_WITH_MPI_COMM, &attr);
+  int nvshmem_status =
+      nvshmemx_init_attr(NVSHMEMX_INIT_WITH_MPI_COMM, &attr);
+  if (nvshmem_status != NVSHMEMX_SUCCESS) {
+    fprintf(stderr, "Rank %d: nvshmemx_init_attr failed with status %d\n",
+            mpi_rank, nvshmem_status);
+    MPI_Abort(MPI_COMM_WORLD, nvshmem_status);
+  }
 
   context->rank = nvshmem_my_pe();
   context->size = nvshmem_n_pes();
