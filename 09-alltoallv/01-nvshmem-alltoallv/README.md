@@ -7,7 +7,8 @@ segment from source `r` at `recv_offsets[r]`.
 
 The counts are deliberately uneven in this exercise. The default `skewed`
 pattern includes a large destination, while `sparse` also includes zero-byte
-pairs. Every element encodes its source PE, destination PE, and index so the
+pairs. `offdiagonal` excludes self traffic for a clean network measurement.
+Every element encodes its source PE, destination PE, and index so the
 program can check the complete receive buffer before reporting performance.
 
 `nvshmem_alltoallv.cu` is the exercise and
@@ -122,7 +123,7 @@ make run_SOLVED NP=4 \
 # InfiniBand: one PE and GPU on each of two nodes
 make run_SOLVED NP=2 \
   LAUNCHER="srun --nodes=2 --ntasks=2 --ntasks-per-node=1 --gpus-per-task=1" \
-  RUN_ARGS="--pattern uniform"
+  RUN_ARGS="--pattern offdiagonal"
 
 # Mixed: two direct peers per node and InfiniBand between nodes
 make run_SOLVED NP=4 \
@@ -137,11 +138,11 @@ proxy-backed baseline; on an installation built for IBGDA, set
 `NVSHMEM_IB_ENABLE_IBGDA=1` to run the same kernel with GPU-initiated network
 progress. No source change is required.
 
-The two-node uniform run should report `0 direct, 2 network`. The two-node,
+The two-node offdiagonal run should report `0 direct, 2 network`. The two-node,
 two-PE-per-node run should report `4 direct, 8 network`. Those counts verify
 the intended placement before interpreting the timing number. In a mixed run,
-the reported aggregate includes both direct and network payload bytes; it is
-not an InfiniBand-only bandwidth measurement.
+the logical non-self rate includes both direct and network payload bytes; use
+the separate network payload rate for an InfiniBand comparison.
 
 ## Exercise
 
@@ -149,9 +150,10 @@ Complete the three communication functions in `nvshmem_alltoallv.cu`.
 
 1. In `exchange_plan`, use block-scoped all-to-all collectives to exchange
    counts, receive offsets, and the sender-selected signal counts.
-2. In `send_chunks`, assign destination/chunk pairs to CTAs. Copy self and
-   direct-peer segments in chunks. For a network PE, issue one put-and-signal
-   for the complete message from thread 0.
+2. In `send_chunks`, assign destination/chunk pairs in chunk-major order so
+   adjacent CTAs begin on different destinations. Copy self and direct-peer
+   segments in chunks. For a network PE, issue one put-and-signal for the
+   complete message from thread 0.
 3. In `wait_for_chunks`, wait for the signal count exchanged by each source.
    Use the source PE and chunk index to address the correct signal slot.
 
@@ -193,10 +195,12 @@ A successful reference run includes:
 NVSHMEM device plan: PASS
 NVSHMEM routes: ... direct, ... network
 NVSHMEM AlltoAllV correctness: PASS
-NVSHMEM AlltoAllV performance: ... ms/iteration, ... GB/s aggregate
+NVSHMEM AlltoAllV performance: ... ms/iteration, ... GB/s logical non-self
+NVSHMEM AlltoAllV payload rates: ... GB/s local, ... GB/s network
 ```
 
 This lab implements an out-of-place collective for 32-bit values. The route
 plan is rebuilt when the counts change, and the fixed chunk size is a tuning
-parameter rather than an automatic policy. The reported bandwidth counts
-remote payload bytes and uses the slowest PE's elapsed time.
+parameter rather than an automatic policy. The traffic summary and split
+payload rates show which part of a mixed result used a direct mapping and
+which part crossed the network.

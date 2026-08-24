@@ -78,8 +78,8 @@ __global__ void pack_and_deliver_local(
   const DevicePlanEntry *plan = static_cast<const DevicePlanEntry *>(
       ncclGetLocalPointer(plan_window, 0));
 
-  for (int destination_local = 0; destination_local < lsa.nRanks;
-       ++destination_local) {
+  for (int step = 0; step < lsa.nRanks; ++step) {
+    const int destination_local = (lsa.rank + step) % lsa.nRanks;
     const int destination = node_first_rank + destination_local;
     const DevicePlanEntry entry = plan[destination];
     const value_type *source = static_cast<const value_type *>(
@@ -104,8 +104,8 @@ __global__ void pack_and_deliver_local(
     const int destination_first_rank = ingress_rank - lsa.rank;
 
     std::size_t payload_offset = header_bytes;
-    for (int destination_local = 0; destination_local < lsa.nRanks;
-         ++destination_local) {
+    for (int step = 0; step < lsa.nRanks; ++step) {
+      const int destination_local = (lsa.rank + step) % lsa.nRanks;
       const int destination = destination_first_rank + destination_local;
       const DevicePlanEntry entry = plan[destination];
       const std::size_t bytes = entry.send_count * sizeof(value_type);
@@ -187,8 +187,8 @@ __global__ void exchange_rails_and_scatter(
         inbox_window, source_node * packet_capacity));
     const HybridPacketItem *items =
         reinterpret_cast<const HybridPacketItem *>(packet);
-    for (int destination_local = 0; destination_local < lsa.nRanks;
-         ++destination_local) {
+    for (int step = 0; step < lsa.nRanks; ++step) {
+      const int destination_local = (lsa.rank + step) % lsa.nRanks;
       const HybridPacketItem item = items[destination_local];
       const value_type *payload =
           reinterpret_cast<const value_type *>(packet + item.payload_offset);

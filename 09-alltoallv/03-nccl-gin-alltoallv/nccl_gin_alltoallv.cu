@@ -52,7 +52,8 @@ __global__ void nccl_gin_alltoallv_kernel(ncclDevComm dev_comm,
   // fence. Every receiver must read signal_before before any sender proceeds.
 
   if (threadIdx.x == 0) {
-    for (int peer = 0; peer < world.nRanks; ++peer) {
+    for (int step = 0; step < world.nRanks; ++step) {
+      const int peer = (world.rank + step) % world.nRanks;
       const DevicePlanEntry entry = entries[peer];
       const Shard shard = shard_for(entry.send_count, blockIdx.x, gridDim.x);
       if (shard.count == 0)

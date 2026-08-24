@@ -50,6 +50,8 @@ struct Plan {
   std::vector<std::uint64_t> recv_counts;
   std::vector<std::uint64_t> recv_offsets;
   std::vector<std::uint64_t> remote_recv_offsets;
+  std::vector<int> node_roots;
+  std::vector<int> local_ranks;
   std::uint64_t send_capacity = 0;
   std::uint64_t recv_capacity = 0;
   std::uint64_t global_send_capacity = 0;
@@ -57,6 +59,12 @@ struct Plan {
   std::uint64_t max_pair_count = 0;
   std::uint64_t global_payload_elements = 0;
   std::uint64_t global_remote_elements = 0;
+  std::uint64_t global_self_elements = 0;
+  std::uint64_t global_local_elements = 0;
+  std::uint64_t global_network_elements = 0;
+  std::uint64_t global_offrail_elements = 0;
+  std::uint64_t max_network_send_elements = 0;
+  std::uint64_t max_network_recv_elements = 0;
 };
 
 inline void mpi_check(int status, const char *call) {
@@ -90,7 +98,7 @@ inline std::uint64_t parse_bytes(const char *text) {
 
 inline void print_usage(const char *program) {
   std::printf(
-      "Usage: %s [--pattern uniform|skewed|sparse] "
+      "Usage: %s [--pattern uniform|offdiagonal|skewed|sparse] "
       "[--bytes-per-rank N[K|M|G]] [--warmup N] [--iters N] "
       "[--blocks N] [--threads N]\n",
       program);
@@ -131,6 +139,7 @@ inline Options parse_options(int argc, char **argv, int rank) {
   }
 
   bool valid_pattern = options.pattern == "uniform" ||
+                       options.pattern == "offdiagonal" ||
                        options.pattern == "skewed" ||
                        options.pattern == "sparse";
   if (!options.help &&
@@ -200,6 +209,8 @@ make_send_counts(int rank, int size, const Options &options) {
         weights[peer] *= 8;
     } else if (options.pattern == "sparse") {
       weights[peer] = hash % 3 == 0 ? 0 : 1 + hash % 5;
+    } else if (options.pattern == "offdiagonal" && peer == rank) {
+      weights[peer] = 0;
     }
   }
 
@@ -248,6 +259,26 @@ inline Plan make_plan(int rank, int size, const Options &options) {
                          MPI_COMM_WORLD),
             "MPI_Alltoall(receive offsets)");
 
+  MPI_Comm local_comm;
+  mpi_check(MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, rank,
+                                MPI_INFO_NULL, &local_comm),
+            "MPI_Comm_split_type(placement)");
+  int local_rank = 0;
+  int node_root = rank;
+  mpi_check(MPI_Comm_rank(local_comm, &local_rank),
+            "MPI_Comm_rank(placement)");
+  mpi_check(MPI_Allreduce(&rank, &node_root, 1, MPI_INT, MPI_MIN, local_comm),
+            "MPI_Allreduce(node root)");
+  MPI_Comm_free(&local_comm);
+  plan.node_roots.resize(size);
+  plan.local_ranks.resize(size);
+  mpi_check(MPI_Allgather(&node_root, 1, MPI_INT, plan.node_roots.data(), 1,
+                          MPI_INT, MPI_COMM_WORLD),
+            "MPI_Allgather(node roots)");
+  mpi_check(MPI_Allgather(&local_rank, 1, MPI_INT, plan.local_ranks.data(), 1,
+                          MPI_INT, MPI_COMM_WORLD),
+            "MPI_Allgather(local ranks)");
+
   mpi_check(MPI_Allreduce(&plan.send_capacity, &plan.global_send_capacity, 1,
                           MPI_UINT64_T, MPI_MAX, MPI_COMM_WORLD),
             "MPI_Allreduce(send capacity)");
@@ -258,11 +289,27 @@ inline Plan make_plan(int rank, int size, const Options &options) {
   std::uint64_t local_max = 0;
   std::uint64_t local_payload = 0;
   std::uint64_t local_remote = 0;
+  std::uint64_t local_self = 0;
+  std::uint64_t local_direct = 0;
+  std::uint64_t local_network = 0;
+  std::uint64_t local_offrail = 0;
+  std::uint64_t local_network_recv = 0;
   for (int peer = 0; peer < size; ++peer) {
     local_max = std::max(local_max, plan.send_counts[peer]);
     local_payload += plan.send_counts[peer];
     if (peer != rank)
       local_remote += plan.send_counts[peer];
+    if (peer == rank) {
+      local_self += plan.send_counts[peer];
+    } else if (plan.node_roots[peer] == plan.node_roots[rank]) {
+      local_direct += plan.send_counts[peer];
+    } else {
+      local_network += plan.send_counts[peer];
+      if (plan.local_ranks[peer] != plan.local_ranks[rank])
+        local_offrail += plan.send_counts[peer];
+    }
+    if (plan.node_roots[peer] != plan.node_roots[rank])
+      local_network_recv += plan.recv_counts[peer];
   }
   mpi_check(MPI_Allreduce(&local_max, &plan.max_pair_count, 1, MPI_UINT64_T,
                           MPI_MAX, MPI_COMM_WORLD),
@@ -273,6 +320,24 @@ inline Plan make_plan(int rank, int size, const Options &options) {
   mpi_check(MPI_Allreduce(&local_remote, &plan.global_remote_elements, 1,
                           MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD),
             "MPI_Allreduce(remote payload)");
+  std::uint64_t local_classes[4] = {local_self, local_direct, local_network,
+                                    local_offrail};
+  std::uint64_t global_classes[4] = {};
+  mpi_check(MPI_Allreduce(local_classes, global_classes, 4, MPI_UINT64_T,
+                          MPI_SUM, MPI_COMM_WORLD),
+            "MPI_Allreduce(traffic classes)");
+  plan.global_self_elements = global_classes[0];
+  plan.global_local_elements = global_classes[1];
+  plan.global_network_elements = global_classes[2];
+  plan.global_offrail_elements = global_classes[3];
+  std::uint64_t local_network_maxima[2] = {local_network,
+                                           local_network_recv};
+  std::uint64_t global_network_maxima[2] = {};
+  mpi_check(MPI_Allreduce(local_network_maxima, global_network_maxima, 2,
+                          MPI_UINT64_T, MPI_MAX, MPI_COMM_WORLD),
+            "MPI_Allreduce(network maxima)");
+  plan.max_network_send_elements = global_network_maxima[0];
+  plan.max_network_recv_elements = global_network_maxima[1];
   return plan;
 }
 
@@ -387,6 +452,19 @@ inline void print_plan(const Plan &plan, const Options &options,
         static_cast<unsigned long long>(global_max),
         static_cast<double>(plan.global_payload_elements * sizeof(value_type)) /
             static_cast<double>(1ull << 20));
+    const double bytes_to_mib =
+        static_cast<double>(sizeof(value_type)) /
+        static_cast<double>(1ull << 20);
+    std::printf(
+        "Traffic per iteration: self=%.3f MiB, local=%.3f MiB, "
+        "network=%.3f MiB, hybrid off-rail scatter=%.3f MiB\n",
+        plan.global_self_elements * bytes_to_mib,
+        plan.global_local_elements * bytes_to_mib,
+        plan.global_network_elements * bytes_to_mib,
+        plan.global_offrail_elements * bytes_to_mib);
+    std::printf("Hottest rank: network send=%.3f MiB, receive=%.3f MiB\n",
+                plan.max_network_send_elements * bytes_to_mib,
+                plan.max_network_recv_elements * bytes_to_mib);
   }
 }
 
@@ -402,8 +480,15 @@ inline void report_timing(const Plan &plan, const Options &options,
   double remote_bytes = static_cast<double>(plan.global_remote_elements) *
                         sizeof(value_type);
   double aggregate_gbs = remote_bytes / (average_ms * 1.0e6);
-  std::printf("%s performance: %.3f ms/iteration, %.3f GB/s aggregate\n",
-              implementation, average_ms, aggregate_gbs);
+  double local_gbs = static_cast<double>(plan.global_local_elements) *
+                     sizeof(value_type) / (average_ms * 1.0e6);
+  double network_gbs = static_cast<double>(plan.global_network_elements) *
+                       sizeof(value_type) / (average_ms * 1.0e6);
+  std::printf(
+      "%s performance: %.3f ms/iteration, %.3f GB/s logical non-self\n",
+      implementation, average_ms, aggregate_gbs);
+  std::printf("%s payload rates: %.3f GB/s local, %.3f GB/s network\n",
+              implementation, local_gbs, network_gbs);
 }
 
 } // namespace alltoallv

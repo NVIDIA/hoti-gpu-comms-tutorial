@@ -34,6 +34,10 @@ For each LSA peer, the kernel:
 3. gets the destination address with `ncclGetLsaPointer`;
 4. copies aligned 16-byte vectors, followed by any remaining elements.
 
+Each source begins with its own LSA rank and then wraps around the team. At a
+given step, different sources therefore write different destinations instead
+of creating a synchronized incast on one GPU.
+
 The kernel uses one LSA barrier per CTA. The acquire barrier at entry ensures
 that every rank has entered the operation before stores begin. The release
 barrier at exit publishes the peer stores before the receiving kernel returns
@@ -111,7 +115,8 @@ than attempting invalid peer accesses. A successful run ends with output like:
 ```text
 NCCL topology: world=4, LSA=4, rail=1
 NCCL LSA AlltoAllV correctness: PASS
-NCCL LSA AlltoAllV performance: ... ms/iteration, ... GB/s aggregate
+NCCL LSA AlltoAllV performance: ... ms/iteration, ... GB/s logical non-self
+NCCL LSA AlltoAllV payload rates: ... GB/s local, 0.000 GB/s network
 ```
 
 The reported bandwidth counts payload sent to other ranks and uses the

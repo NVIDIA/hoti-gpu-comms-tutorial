@@ -29,6 +29,11 @@ its own signal index, `blockIdx.x`. On a receiver, the incoming counts tell CTA
 `b` exactly how many sources have a non-empty shard `b`, so it knows the signal
 value to wait for even for the `sparse` pattern.
 
+Source rank `r` visits peers in the order `r, r+1, ...` with wraparound. This
+keeps all sources from targeting peer 0 at the same time. CTA count still
+controls both transfer size and operation count, so it is a parameter to
+measure rather than an occupancy knob that should always be increased.
+
 The synchronization sequence in each CTA is:
 
 ```text
@@ -114,7 +119,8 @@ The clearest GIN-only placement uses one GPU per node:
 
 ```bash
 make run_SOLVED NP=2 \
-  LAUNCHER="srun --nodes=2 --ntasks-per-node=1 --gpus-per-task=1"
+  LAUNCHER="srun --nodes=2 --ntasks-per-node=1 --gpus-per-task=1" \
+  RUN_ARGS="--pattern offdiagonal"
 ```
 
 The run target defaults to `NCCL_IB_MERGE_NICS=0` and `NCCL_CROSS_NIC=1`.
@@ -139,7 +145,8 @@ it prints `SKIP`. A successful run ends with output like:
 ```text
 NCCL topology: world=2, LSA=1, rail=2
 NCCL GIN AlltoAllV correctness: PASS
-NCCL GIN AlltoAllV performance: ... ms/iteration, ... GB/s aggregate
+NCCL GIN AlltoAllV performance: ... ms/iteration, ... GB/s logical non-self
+NCCL GIN AlltoAllV payload rates: 0.000 GB/s local, ... GB/s network
 ```
 
 The reported bandwidth counts payload sent to other ranks and uses the

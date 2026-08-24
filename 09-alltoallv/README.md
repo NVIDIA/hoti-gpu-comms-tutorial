@@ -74,7 +74,7 @@ Makefile, and the exact API and topology requirements for that implementation.
 Every executable accepts the same workload options:
 
 ```text
---pattern uniform|skewed|sparse
+--pattern uniform|offdiagonal|skewed|sparse
 --bytes-per-rank N[K|M|G]
 --warmup N
 --iters N
@@ -83,12 +83,24 @@ Every executable accepts the same workload options:
 ```
 
 `--bytes-per-rank` is each source rank's total logical payload before aligned
-gaps. `skewed` is the default and gives one destination a much larger share.
-`sparse` includes zero-count pairs. The programs first run one iteration and
-validate every rank, then time warm and measured iterations. Reported
-aggregate GB/s counts non-self payload bytes once; it is useful for comparing
-these implementations under the same placement, not as a claim about a
-particular link's line rate.
+gaps. `uniform` divides it across every rank, including the source itself.
+`offdiagonal` divides it only among other ranks and is the useful pattern for
+isolating the network with one GPU per node. `skewed` is the default and gives
+one destination a much larger share. `sparse` includes zero-count pairs.
+
+The programs first validate one iteration, then time warm and measured
+iterations. The output separates self, same-node, and inter-node bytes. The
+main logical bandwidth is `(same-node + inter-node bytes) / slowest-rank
+time`; self copies are timed but are not in that numerator. The two payload
+rates use the same elapsed time and show the same-node and inter-node parts
+separately.
+
+Use the inter-node payload rate for an IB comparison. The combined logical
+rate from a mixed NVLink-plus-IB run is not an IB bandwidth number. The hybrid
+algorithm also reads and writes every remote byte while packing, across the
+network, and again while scattering, so its minimum memory traffic is six
+bytes per remote logical byte. Those serialized copies can be the limit even
+when the rails are not full.
 
 The harness uses MPI only for bootstrap, metadata needed to construct the
 reference answer, error reduction, and benchmark alignment. MPI is not the

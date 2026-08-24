@@ -52,7 +52,8 @@ __global__ void nccl_lsa_alltoallv_kernel(ncclDevComm dev_comm,
   const ncclTeam lsa_team = ncclTeamLsa(dev_comm);
   const DevicePlanEntry *entries =
       static_cast<const DevicePlanEntry *>(ncclGetLocalPointer(plan_window, 0));
-  for (int lsa_peer = 0; lsa_peer < lsa_team.nRanks; ++lsa_peer) {
+  for (int step = 0; step < lsa_team.nRanks; ++step) {
+    const int lsa_peer = (lsa_team.rank + step) % lsa_team.nRanks;
     const int world_peer = ncclTeamRankToWorld(dev_comm, lsa_team, lsa_peer);
     const DevicePlanEntry entry = entries[world_peer];
     const value_type *source =

@@ -66,7 +66,8 @@ __global__ void send_chunks(const value_type *send_buffer,
                             std::uint64_t chunk_bytes, std::uint64_t max_chunks,
                             std::uint64_t epoch) {
   /*
-   * TODO: Assign destination/chunk pairs to CTAs. Copy self and directly
+   * TODO: Assign destination/chunk pairs to CTAs in chunk-major order so
+   * adjacent CTAs start on different destinations. Copy self and directly
    * accessible messages in chunks. For another PE, use nvshmem_ptr to choose
    * a block-scoped put-with-signal for each direct chunk or one thread-scoped
    * put-with-signal for the complete network message.

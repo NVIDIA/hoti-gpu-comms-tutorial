@@ -84,8 +84,8 @@ __global__ void send_chunks(const value_type *send_buffer,
                             std::uint64_t epoch) {
   std::uint64_t task_count = static_cast<std::uint64_t>(nranks) * max_chunks;
   for (std::uint64_t task = blockIdx.x; task < task_count; task += gridDim.x) {
-    int destination = static_cast<int>(task / max_chunks);
-    std::uint64_t chunk = task % max_chunks;
+    int destination = static_cast<int>(task % nranks);
+    std::uint64_t chunk = task / nranks;
     std::uint64_t pair_bytes = send_counts_bytes[destination];
     char *pair_destination = reinterpret_cast<char *>(recv_buffer) +
                              remote_recv_offsets_bytes[destination];

@@ -30,6 +30,10 @@ submessage to its final local GPU through an LSA pointer. This keeps every
 rail active while reducing network operations from one per destination GPU to
 one per destination node.
 
+Local delivery and final scatter rotate their first LSA destination by the
+source GPU's LSA rank. That spreads each step across the local GPUs instead of
+making every source or ingress GPU write the same destination at once.
+
 ## Packet format
 
 The host allocates symmetric outbox and inbox windows. Each remote-node slot
@@ -144,7 +148,7 @@ line if a system has a different validated mapping. The Makefile also puts
 library come from the same installation.
 
 The four-rank command is the smallest mixed placement. To exercise every GPU
-and rail on two eight-GPU nodes, use 16 tasks with 8 tasks per node.
+and rail on two four-GPU nodes, use 8 tasks with 4 tasks per node.
 
 Pass the same workload controls used by the other AlltoAllV labs through
 `RUN_ARGS`:
@@ -158,7 +162,10 @@ make run_SOLVED NP=4 \
 The program prints the discovered world, LSA, and rail sizes. It prints
 `SKIP` instead of guessing when the placement does not form uniform LSA and
 rail teams or when railed GIN is unavailable. A successful run reports both
-correctness and the slowest-rank iteration time.
+correctness and the slowest-rank iteration time. For a mixed run, use the
+separate network payload rate when comparing with the IB rails. The combined
+logical rate also includes local LSA traffic, while each remote byte incurs a
+pack copy and a scatter copy in addition to the network transfer.
 
 This implementation uses ordinary Hopper-compatible loads, stores, and GIN
 operations. It does not require NVLS, multimem instructions, or a

@@ -79,7 +79,7 @@ __global__ void pack_and_deliver_local(
 
   /* TODO:
    * 1. Copy messages for this LSA domain directly into each local peer's
-   *    receive window.
+   *    receive window, rotating the first destination by lsa.rank.
    * 2. For every remote rail rank, write one HybridPacketItem per destination
    *    LSA rank and pack the corresponding payload into that outbox slot.
    */
