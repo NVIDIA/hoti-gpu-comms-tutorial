@@ -47,6 +47,8 @@ its signal without quieting after every chunk. A second kernel waits for the
 signal counts the senders supplied during setup before the CUDA stream can
 consume the buffer. Signal values increase on every iteration, so the benchmark
 reuses the signal table without clearing it.
+The receiver waits followed by the next call's world barrier make that reuse
+safe; issuing an NBI operation alone is not a completion guarantee.
 The [NVSHMEM signaling reference](https://docs.nvidia.com/nvshmem/api/latest/gen/api/signal.html)
 defines the payload-before-signal guarantee used here.
 

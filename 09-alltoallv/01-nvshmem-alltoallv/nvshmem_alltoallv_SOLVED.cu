@@ -19,6 +19,7 @@ using alltoallv::value_type;
 
 constexpr std::uint64_t kDefaultDirectChunkBytes = 256ull << 10;
 constexpr std::uint64_t kDefaultNetworkChunkBytes = 4ull << 20;
+constexpr int kNetworkQpCount = 8;
 constexpr std::uint64_t kMetadataAlignment = 16;
 
 __device__ std::uint64_t align_bytes(std::uint64_t value) {
@@ -86,6 +87,8 @@ __global__ void send_chunks(const value_type *send_buffer,
                             std::uint64_t *signals, int rank, int nranks,
                             std::uint64_t direct_chunk_bytes,
                             std::uint64_t network_chunk_bytes,
+                            const nvshmemx_qp_handle_t *network_qps,
+                            int network_qp_count,
                             std::uint64_t max_chunks,
                             std::uint64_t epoch) {
   std::uint64_t task_count = static_cast<std::uint64_t>(nranks) * max_chunks;
@@ -136,10 +139,13 @@ __global__ void send_chunks(const value_type *send_buffer,
           signals + static_cast<std::uint64_t>(rank) * max_chunks + chunk,
           epoch, NVSHMEM_SIGNAL_SET, destination);
     } else if (threadIdx.x == 0) {
-      nvshmem_putmem_signal_nbi(
-          destination_address, source, bytes,
+      nvshmemx_qp_uint_put_signal_nbi(
+          reinterpret_cast<value_type *>(destination_address),
+          reinterpret_cast<const value_type *>(source),
+          bytes / sizeof(value_type),
           signals + static_cast<std::uint64_t>(rank) * max_chunks + chunk,
-          epoch, NVSHMEM_SIGNAL_SET, destination);
+          epoch, NVSHMEM_SIGNAL_SET, destination,
+          network_qps[chunk % static_cast<std::uint64_t>(network_qp_count)]);
     }
     __syncthreads();
   }
@@ -326,6 +332,8 @@ void launch_alltoallv(const value_type *send_buffer, value_type *recv_buffer,
                       std::uint64_t *signals, int rank, int nranks,
                       std::uint64_t direct_chunk_bytes,
                       std::uint64_t network_chunk_bytes,
+                      const nvshmemx_qp_handle_t *network_qps,
+                      int network_qp_count,
                       std::uint64_t max_chunks, std::uint64_t epoch,
                       const alltoallv::Options &options, cudaStream_t stream) {
   int unused = 0;
@@ -341,7 +349,7 @@ void launch_alltoallv(const value_type *send_buffer, value_type *recv_buffer,
   send_chunks<<<options.blocks, options.threads, 0, stream>>>(
       send_buffer, recv_buffer, send_counts_bytes, send_offsets_bytes,
       remote_recv_offsets_bytes, signals, rank, nranks, direct_chunk_bytes,
-      network_chunk_bytes, max_chunks, epoch);
+      network_chunk_bytes, network_qps, network_qp_count, max_chunks, epoch);
   CUDA_CHECK(cudaGetLastError());
   void *args[] = {&recv_signal_counts, &signals, &rank, &nranks, &max_chunks,
                   &epoch};
@@ -363,7 +371,9 @@ void free_allocations(value_type *send_buffer, value_type *recv_buffer,
                       std::uint64_t *remote_recv_offsets_bytes,
                       std::uint64_t *send_signal_counts,
                       std::uint64_t *recv_signal_counts,
-                      std::uint64_t *signals, int *device_status) {
+                      std::uint64_t *signals, int *device_status,
+                      nvshmemx_qp_handle_t *network_qps,
+                      nvshmemx_qp_handle_t *host_network_qps) {
   nvshmem_free(send_buffer);
   nvshmem_free(recv_buffer);
   nvshmem_free(send_counts_bytes);
@@ -375,6 +385,8 @@ void free_allocations(value_type *send_buffer, value_type *recv_buffer,
   nvshmem_free(recv_signal_counts);
   nvshmem_free(signals);
   CUDA_CHECK(cudaFree(device_status));
+  CUDA_CHECK(cudaFree(network_qps));
+  std::free(host_network_qps);
 }
 
 } // namespace
@@ -415,6 +427,21 @@ int main(int argc, char **argv) {
   }
   std::uint64_t signal_count =
       static_cast<std::uint64_t>(context.size) * max_chunks;
+
+  nvshmemx_qp_handle_t *host_network_qps = nullptr;
+  int qp_status = nvshmemx_qp_create(kNetworkQpCount, &host_network_qps);
+  if (qp_status != NVSHMEMX_SUCCESS || host_network_qps == nullptr) {
+    if (context.rank == 0)
+      std::fprintf(stderr, "NVSHMEM network QP creation failed: %d\n",
+                   qp_status);
+    MPI_Abort(MPI_COMM_WORLD, qp_status == 0 ? 1 : qp_status);
+  }
+  nvshmemx_qp_handle_t *network_qps = nullptr;
+  CUDA_CHECK(cudaMalloc(&network_qps,
+                        kNetworkQpCount * sizeof(*network_qps)));
+  CUDA_CHECK(cudaMemcpy(network_qps, host_network_qps,
+                        kNetworkQpCount * sizeof(*network_qps),
+                        cudaMemcpyHostToDevice));
 
   value_type *send_buffer =
       symmetric_alloc<value_type>(plan.global_send_capacity);
@@ -502,7 +529,8 @@ int main(int argc, char **argv) {
     free_allocations(send_buffer, recv_buffer, send_counts_bytes,
                      send_offsets_bytes, recv_counts_bytes, recv_offsets_bytes,
                      remote_recv_offsets_bytes, send_signal_counts,
-                     recv_signal_counts, signals, device_status);
+                     recv_signal_counts, signals, device_status, network_qps,
+                     host_network_qps);
     exercise_finalize(&context);
     return 1;
   }
@@ -512,7 +540,8 @@ int main(int argc, char **argv) {
     free_allocations(send_buffer, recv_buffer, send_counts_bytes,
                      send_offsets_bytes, recv_counts_bytes, recv_offsets_bytes,
                      remote_recv_offsets_bytes, send_signal_counts,
-                     recv_signal_counts, signals, device_status);
+                     recv_signal_counts, signals, device_status, network_qps,
+                     host_network_qps);
     exercise_finalize(&context);
     return 1;
   }
@@ -521,14 +550,21 @@ int main(int argc, char **argv) {
     std::printf("NVSHMEM chunk sizes: direct=%llu bytes, network=%llu bytes\n",
                 static_cast<unsigned long long>(direct_chunk_bytes),
                 static_cast<unsigned long long>(network_chunk_bytes));
+  if (context.rank == 0) {
+    int explicit_qps = 0;
+    for (int index = 0; index < kNetworkQpCount; ++index)
+      explicit_qps += host_network_qps[index] != NVSHMEMX_QP_DEFAULT;
+    std::printf("NVSHMEM network QPs: requested=%d, explicit=%d\n",
+                kNetworkQpCount, explicit_qps);
+  }
   print_route_summary(recv_buffer, context.rank, context.size);
 
   std::uint64_t epoch = 1;
   launch_alltoallv(
       send_buffer, recv_buffer, send_counts_bytes, send_offsets_bytes,
       recv_signal_counts, remote_recv_offsets_bytes, signals, context.rank,
-      context.size, direct_chunk_bytes, network_chunk_bytes, max_chunks,
-      epoch++, options, context.stream);
+      context.size, direct_chunk_bytes, network_chunk_bytes, network_qps,
+      kNetworkQpCount, max_chunks, epoch++, options, context.stream);
   CUDA_CHECK(cudaStreamSynchronize(context.stream));
 
   std::vector<value_type> observed(plan.global_recv_capacity);
@@ -540,7 +576,8 @@ int main(int argc, char **argv) {
     free_allocations(send_buffer, recv_buffer, send_counts_bytes,
                      send_offsets_bytes, recv_counts_bytes, recv_offsets_bytes,
                      remote_recv_offsets_bytes, send_signal_counts,
-                     recv_signal_counts, signals, device_status);
+                     recv_signal_counts, signals, device_status, network_qps,
+                     host_network_qps);
     exercise_finalize(&context);
     return 1;
   }
@@ -550,7 +587,8 @@ int main(int argc, char **argv) {
                      send_offsets_bytes, recv_signal_counts,
                      remote_recv_offsets_bytes, signals, context.rank,
                      context.size, direct_chunk_bytes, network_chunk_bytes,
-                     max_chunks, epoch++, options, context.stream);
+                     network_qps, kNetworkQpCount, max_chunks, epoch++, options,
+                     context.stream);
   }
   CUDA_CHECK(cudaStreamSynchronize(context.stream));
   alltoallv::mpi_check(MPI_Barrier(MPI_COMM_WORLD), "MPI_Barrier(timing)");
@@ -565,7 +603,8 @@ int main(int argc, char **argv) {
                      send_offsets_bytes, recv_signal_counts,
                      remote_recv_offsets_bytes, signals, context.rank,
                      context.size, direct_chunk_bytes, network_chunk_bytes,
-                     max_chunks, epoch++, options, context.stream);
+                     network_qps, kNetworkQpCount, max_chunks, epoch++, options,
+                     context.stream);
   }
   CUDA_CHECK(cudaEventRecord(stop, context.stream));
   CUDA_CHECK(cudaEventSynchronize(stop));
@@ -581,8 +620,8 @@ int main(int argc, char **argv) {
   launch_alltoallv(
       send_buffer, recv_buffer, send_counts_bytes, send_offsets_bytes,
       recv_signal_counts, remote_recv_offsets_bytes, signals, context.rank,
-      context.size, direct_chunk_bytes, network_chunk_bytes, max_chunks,
-      epoch++, options, context.stream);
+      context.size, direct_chunk_bytes, network_chunk_bytes, network_qps,
+      kNetworkQpCount, max_chunks, epoch++, options, context.stream);
   CUDA_CHECK(cudaStreamSynchronize(context.stream));
   CUDA_CHECK(cudaMemcpy(observed.data(), recv_buffer,
                         plan.global_recv_capacity * sizeof(value_type),
@@ -592,7 +631,8 @@ int main(int argc, char **argv) {
     free_allocations(send_buffer, recv_buffer, send_counts_bytes,
                      send_offsets_bytes, recv_counts_bytes, recv_offsets_bytes,
                      remote_recv_offsets_bytes, send_signal_counts,
-                     recv_signal_counts, signals, device_status);
+                     recv_signal_counts, signals, device_status, network_qps,
+                     host_network_qps);
     exercise_finalize(&context);
     return 1;
   }
@@ -600,7 +640,8 @@ int main(int argc, char **argv) {
   free_allocations(send_buffer, recv_buffer, send_counts_bytes,
                    send_offsets_bytes, recv_counts_bytes, recv_offsets_bytes,
                    remote_recv_offsets_bytes, send_signal_counts,
-                   recv_signal_counts, signals, device_status);
+                   recv_signal_counts, signals, device_status, network_qps,
+                   host_network_qps);
   exercise_finalize(&context);
   return 0;
 }
