@@ -131,12 +131,12 @@ __global__ void send_chunks(const value_type *send_buffer,
            element < bytes / sizeof(value_type); element += blockDim.x)
         destination_elements[element] = source_elements[element];
     } else if (peer_pointer != nullptr) {
-      nvshmemx_putmem_signal_block(
+      nvshmemx_putmem_signal_nbi_block(
           destination_address, source, bytes,
           signals + static_cast<std::uint64_t>(rank) * max_chunks + chunk,
           epoch, NVSHMEM_SIGNAL_SET, destination);
     } else if (threadIdx.x == 0) {
-      nvshmem_putmem_signal(
+      nvshmem_putmem_signal_nbi(
           destination_address, source, bytes,
           signals + static_cast<std::uint64_t>(rank) * max_chunks + chunk,
           epoch, NVSHMEM_SIGNAL_SET, destination);

@@ -35,17 +35,18 @@ node uses both paths from the same kernel.
 
 Direct and network transfers use different chunk sizes. The smaller direct
 chunks give many CTAs work on the NVLink path. Network chunks are larger so
-the kernel can issue concurrent operations across available NICs without
-turning a large message into thousands of tiny RMAs. Both paths remain in one
-kernel and use the same completion protocol.
+an IBGDA transport has enough independent operations to use its available
+QPs and NICs without turning a large message into thousands of tiny RMAs.
+Both paths remain in one kernel and use the same completion protocol.
 
 Each call begins with a block-scoped world barrier on the same CUDA stream.
 That handshake says every PE has finished consuming the previous receive
 buffer before any PE can overwrite it. Every direct or network chunk has a
-separate signal slot. The put-with-signal orders its payload before its signal,
-and a second kernel waits for the signal counts the senders supplied during
-setup before the CUDA stream can consume the buffer. Signal values increase on
-every iteration, so the benchmark reuses the signal table without clearing it.
+separate signal slot. The nonblocking put-with-signal orders its payload before
+its signal without quieting after every chunk. A second kernel waits for the
+signal counts the senders supplied during setup before the CUDA stream can
+consume the buffer. Signal values increase on every iteration, so the benchmark
+reuses the signal table without clearing it.
 The [NVSHMEM signaling reference](https://docs.nvidia.com/nvshmem/api/latest/gen/api/signal.html)
 defines the payload-before-signal guarantee used here.
 
@@ -157,7 +158,7 @@ Complete the three communication functions in `nvshmem_alltoallv.cu`.
 2. In `send_chunks`, assign destination/chunk pairs in chunk-major order so
    adjacent CTAs begin on different destinations. Copy self and direct-peer
    segments in the smaller direct chunks. For a network PE, issue each larger
-   network chunk with one thread-scoped put-and-signal.
+   network chunk with one thread-scoped NBI put-and-signal.
 3. In `wait_for_chunks`, wait for the signal count exchanged by each source.
    Use the source PE and chunk index to address the correct signal slot.
 
@@ -170,11 +171,11 @@ int nvshmemx_uint64_alltoall_block(
 
 void *nvshmem_ptr(const void *symmetric_address, int pe);
 
-void nvshmemx_putmem_signal_block(
+void nvshmemx_putmem_signal_nbi_block(
     void *dest, const void *source, size_t bytes,
     uint64_t *signal_address, uint64_t signal, int signal_op, int pe);
 
-void nvshmem_putmem_signal(
+void nvshmem_putmem_signal_nbi(
     void *dest, const void *source, size_t bytes,
     uint64_t *signal_address, uint64_t signal, int signal_op, int pe);
 
