@@ -321,7 +321,7 @@ inline SetupResult prepare(State *state, int *argc, char ***argv,
   if (backend == Backend::Lsa) {
     requirements.lsaBarrierCount = options->blocks;
   } else if (backend == Backend::Gin) {
-    requirements.ginContextCount = 1;
+    requirements.ginContextCount = options->blocks;
     requirements.worldGinBarrierCount = options->blocks;
     requirements.ginSignalCount = options->blocks;
     requirements.ginConnectionType = NCCL_GIN_CONNECTION_FULL;

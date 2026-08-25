@@ -42,7 +42,12 @@ __global__ void nccl_gin_alltoallv_kernel(ncclDevComm dev_comm,
   const ncclTeam world = ncclTeamWorld(dev_comm);
   const DevicePlanEntry *entries =
       static_cast<const DevicePlanEntry *>(ncclGetLocalPointer(plan_window, 0));
-  ncclGin gin(dev_comm, 0);
+  const int context_count =
+      min(static_cast<int>(gridDim.x),
+          static_cast<int>(dev_comm.ginContextCount));
+  const int context =
+      static_cast<int>(blockIdx.x) * context_count / gridDim.x;
+  ncclGin gin(dev_comm, context);
   const ncclGinSignal_t signal = static_cast<ncclGinSignal_t>(blockIdx.x);
   const std::uint64_t signal_before = gin.readSignal(signal);
   ncclGinBarrierSession<ncclCoopCta> barrier{ncclCoopCta(), gin,

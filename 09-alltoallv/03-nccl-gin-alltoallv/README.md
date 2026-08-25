@@ -24,15 +24,18 @@ send segment:  [ CTA 0 ][ CTA 1 ][ CTA 2 ] ... [ CTA B-1 ]
 signal index:       0       1       2                B-1
 ```
 
-Each non-empty shard becomes one GIN put. Every CTA uses GIN context 0 and has
-its own signal index, `blockIdx.x`. On a receiver, the incoming counts tell CTA
-`b` exactly how many sources have a non-empty shard `b`, so it knows the signal
-value to wait for even for the `sparse` pattern.
+Each non-empty shard becomes one GIN put. The host requests one GIN context per
+CTA, and the kernel distributes the CTAs over however many contexts NCCL was
+able to create. Each CTA has its own signal index, `blockIdx.x`. On a receiver,
+the incoming counts tell CTA `b` exactly how many sources have a non-empty
+shard `b`, so it knows the signal value to wait for even for the `sparse`
+pattern.
 
 Source rank `r` visits peers in the order `r, r+1, ...` with wraparound. This
 keeps all sources from targeting peer 0 at the same time. CTA count still
-controls both transfer size and operation count, so it is a parameter to
-measure rather than an occupancy knob that should always be increased.
+controls transfer size, operation count, and the requested GIN parallelism,
+so it is a parameter to measure rather than an occupancy knob that should
+always be increased.
 
 The synchronization sequence in each CTA is:
 
@@ -82,8 +85,10 @@ void ncclGinBarrierSession::sync(
     Coop coop, cuda::memory_order order, ncclGinFenceLevel fence);
 ```
 
-The put offsets and size are bytes. Only thread 0 in each CTA issues puts;
-`waitSignal` and `flush` are called cooperatively by the full CTA.
+The put offsets and size are bytes. `ncclDevComm::ginContextCount` is the
+number of contexts NCCL actually made, which can be smaller than the host
+request. Only thread 0 in each CTA issues puts; `waitSignal` and `flush` are
+called cooperatively by the full CTA.
 
 ## Exercise
 
