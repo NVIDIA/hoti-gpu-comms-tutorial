@@ -26,7 +26,7 @@ nvshmem_ptr(receive address, destination)
         |
         +-- non-null: chunked block-scoped puts-with-signal (direct path)
         |
-        `-- null:     chunked thread-scoped puts-with-signal (network path)
+        `-- null:     chunked QP-specific puts-with-signal (network path)
 ```
 
 On a single node, directly mapped peers normally take the first path. PEs on
@@ -39,16 +39,26 @@ an IBGDA transport has enough independent operations to use its available
 QPs and NICs without turning a large message into thousands of tiny RMAs.
 Both paths remain in one kernel and use the same completion protocol.
 
+The setup collectively requests several NVSHMEM QP handles and copies those
+handles to the GPU. Network chunks choose a handle from both their destination
+and chunk index. On an IBGDA system with several selected HCAs, that lets
+different chunks use different rails. A transport that does not provide a
+custom QP returns `NVSHMEMX_QP_DEFAULT`; the same device call then falls back
+to the default NVSHMEM path.
+
 Each call begins with a block-scoped world barrier on the same CUDA stream.
 That handshake says every PE has finished consuming the previous receive
 buffer before any PE can overwrite it. Every direct or network chunk has a
 separate signal slot. The nonblocking put-with-signal orders its payload before
 its signal without quieting after every chunk. A second kernel waits for the
 signal counts the senders supplied during setup before the CUDA stream can
-consume the buffer. Signal values increase on every iteration, so the benchmark
-reuses the signal table without clearing it.
-The receiver waits followed by the next call's world barrier make that reuse
-safe; issuing an NBI operation alone is not a completion guarantee.
+consume the buffer. While those receiver waits are running, one thread quiets
+all default and custom QPs. The waits make the local receive buffer ready,
+while the all-QP quiet makes the local send buffer safe to reuse. Signal values
+increase on every iteration, so the benchmark reuses the signal table without
+clearing it. The entry barrier in the next call prevents any PE from
+overwriting a receive buffer while another PE is still consuming the previous
+result. Issuing an NBI operation alone is not a completion guarantee.
 The [NVSHMEM signaling reference](https://docs.nvidia.com/nvshmem/api/latest/gen/api/signal.html)
 defines the payload-before-signal guarantee used here.
 
@@ -78,7 +88,8 @@ be made collectively with a compatible size and ordering.
 ## Build
 
 Load CUDA, MPI, and NVSHMEM, then set `NVSHMEM_HOME` to the installation
-prefix containing `include/` and `lib/`:
+prefix containing `include/` and `lib/`. This exercise needs a current NVSHMEM
+installation with the explicit-QP APIs and `NVSHMEMX_QP_ALL`:
 
 ```bash
 export NVSHMEM_HOME=/path/to/nvshmem
@@ -100,6 +111,9 @@ defaults:
 make run_SOLVED NP=4
 ```
 
+That default is a quick correctness run. Use a larger payload, more warmup,
+and more CTAs when measuring bandwidth.
+
 Pass command-line options through `RUN_ARGS`:
 
 ```bash
@@ -108,12 +122,14 @@ make run_SOLVED NP=4 \
 ```
 
 `CHUNK_BYTES` controls direct-path and self-copy chunks;
-`NETWORK_CHUNK_BYTES` controls the larger network chunks. They accept the same
-`K`, `M`, and `G` suffixes as `--bytes-per-rank` and must be multiples of 16
-bytes:
+`NETWORK_CHUNK_BYTES` controls the larger network chunks, and `NETWORK_QPS`
+controls how many QP handles are requested collectively. Chunk sizes accept
+the same `K`, `M`, and `G` suffixes as `--bytes-per-rank` and must be multiples
+of 16 bytes. `NETWORK_QPS` must be positive and identical on every PE:
 
 ```bash
-make run_SOLVED NP=4 CHUNK_BYTES=256K NETWORK_CHUNK_BYTES=4M
+make run_SOLVED NP=4 \
+  CHUNK_BYTES=256K NETWORK_CHUNK_BYTES=8M NETWORK_QPS=8
 ```
 
 Placement determines which transport paths the kernel exercises. With a
@@ -122,17 +138,18 @@ Slurm allocation, representative launch shapes are:
 ```bash
 # NVLink/direct peer paths within one node
 make run_SOLVED NP=4 \
-  LAUNCHER="srun --nodes=1 --ntasks=4 --gpus-per-task=1"
+  LAUNCHER="srun --nodes=1 --ntasks=4 --gpus-per-task=1" \
+  RUN_ARGS="--pattern offdiagonal --bytes-per-rank 64M --blocks 128 --warmup 20 --iters 200"
 
 # InfiniBand: one PE and GPU on each of two nodes
 make run_SOLVED NP=2 \
   LAUNCHER="srun --nodes=2 --ntasks=2 --ntasks-per-node=1 --gpus-per-task=1" \
-  RUN_ARGS="--pattern offdiagonal"
+  RUN_ARGS="--pattern offdiagonal --bytes-per-rank 64M --blocks 128 --warmup 50 --iters 1000"
 
 # Mixed: two direct peers per node and InfiniBand between nodes
 make run_SOLVED NP=4 \
   LAUNCHER="srun --nodes=2 --ntasks=4 --ntasks-per-node=2 --gpus-per-task=1" \
-  RUN_ARGS="--pattern uniform"
+  RUN_ARGS="--pattern offdiagonal --bytes-per-rank 64M --blocks 64 --warmup 50 --iters 500"
 ```
 
 Use the node and task counts allowed by the current allocation. NVSHMEM must
@@ -158,11 +175,14 @@ Complete the three communication functions in `nvshmem_alltoallv.cu`.
 1. In `exchange_plan`, use block-scoped all-to-all collectives to exchange
    counts, receive offsets, and the sender-selected signal counts.
 2. In `send_chunks`, assign destination/chunk pairs in chunk-major order so
-   adjacent CTAs begin on different destinations. Copy self and direct-peer
-   segments in the smaller direct chunks. For a network PE, issue each larger
-   network chunk with one thread-scoped NBI put-and-signal.
+   adjacent CTAs begin on different destinations, and rotate the first
+   destination by the source rank to avoid synchronized incast. Copy self and
+   direct-peer segments in the smaller direct chunks. For a network PE, issue
+   each larger network chunk with a QP-specific thread-scoped NBI
+   put-and-signal. Select the handle from the destination and chunk index.
 3. In `wait_for_chunks`, wait for the signal count exchanged by each source.
-   Use the source PE and chunk index to address the correct signal slot.
+   Use the source PE and chunk index to address the correct signal slot, and
+   have one thread quiet all QPs so the sender can safely reuse its input.
 
 The APIs used in those functions are:
 
@@ -177,15 +197,31 @@ void nvshmemx_putmem_signal_nbi_block(
     void *dest, const void *source, size_t bytes,
     uint64_t *signal_address, uint64_t signal, int signal_op, int pe);
 
-void nvshmem_putmem_signal_nbi(
-    void *dest, const void *source, size_t bytes,
-    uint64_t *signal_address, uint64_t signal, int signal_op, int pe);
+int nvshmemx_qp_create(
+    int num_qps, nvshmemx_qp_handle_t **out_qp_array);
+
+void nvshmemx_qp_uint_put_signal_nbi(
+    uint32_t *dest, const uint32_t *source, size_t nelems,
+    uint64_t *signal_address, uint64_t signal, int signal_op, int pe,
+    nvshmemx_qp_handle_t qp);
 
 uint64_t nvshmem_signal_wait_until(
     uint64_t *signal_address, int comparison, uint64_t value);
 
+void nvshmemx_qp_quiet(
+    int pe, nvshmemx_qp_handle_t *qps, int num_qps);
+
 void nvshmemx_barrier_all_block();
 ```
+
+`nvshmemx_qp_create` is collective over `NVSHMEM_TEAM_WORLD`, so every PE must
+request the same number of handles. NVSHMEM allocates the returned host array,
+and the API requires it to remain allocated through finalization; this program
+frees it only after `nvshmem_finalize`. In the wait kernel, a handle value of
+`NVSHMEMX_QP_ALL` with `NVSHMEMX_PE_ALL` makes the quiet cover default and
+custom QPs. The
+[NVSHMEM QP reference](https://docs.nvidia.com/nvshmem/api/latest/gen/api/qp.html)
+defines the handle fallback, lifetime, and synchronization rules.
 
 The setup, entry-barrier, and wait kernels are launched with
 `nvshmemx_collective_launch`. The wait kernel uses NVSHMEM synchronization

@@ -50,10 +50,10 @@ Railed GIN is different. It connects GPU 0 to GPU 0 across nodes, GPU 1 to GPU
 node, sends each packet on the source GPU's rail, and then scatters it with LSA
 on the receiving node.
 
-NVSHMEM exposes a single put API across these topologies. Its implementation
-uses `nvshmem_ptr` to detect direct peer mappings and chooses a block-scoped
-put for that path while retaining an ordinary device put for network peers.
-The correctness protocol remains the same.
+The NVSHMEM lab uses one source implementation across these topologies. It
+uses `nvshmem_ptr` to detect direct peer mappings, chooses a block-scoped put
+for that path, and uses explicit QP handles for network peers. The correctness
+protocol remains the same.
 
 ## Exercises
 

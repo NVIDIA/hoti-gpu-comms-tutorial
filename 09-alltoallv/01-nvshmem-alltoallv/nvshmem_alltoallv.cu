@@ -18,7 +18,8 @@ namespace {
 using alltoallv::value_type;
 
 constexpr std::uint64_t kDefaultDirectChunkBytes = 256ull << 10;
-constexpr std::uint64_t kDefaultNetworkChunkBytes = 4ull << 20;
+constexpr std::uint64_t kDefaultNetworkChunkBytes = 8ull << 20;
+constexpr int kDefaultNetworkQpCount = 8;
 constexpr std::uint64_t kMetadataAlignment = 16;
 
 __device__ std::uint64_t align_bytes(std::uint64_t value) {
@@ -35,8 +36,7 @@ __global__ void exchange_plan(const std::uint64_t *send_counts_bytes,
                               std::uint64_t *send_signal_counts,
                               std::uint64_t *recv_signal_counts, int rank,
                               int nranks, std::uint64_t direct_chunk_bytes,
-                              std::uint64_t network_chunk_bytes,
-                              int *status) {
+                              std::uint64_t network_chunk_bytes, int *status) {
   /*
    * TODO: Exchange send_counts_bytes with a block-scoped NVSHMEM all-to-all,
    * build the aligned receive offsets, and exchange those offsets back to the
@@ -60,22 +60,22 @@ __global__ void exchange_plan(const std::uint64_t *send_counts_bytes,
     *status = -1;
 }
 
-__global__ void send_chunks(const value_type *send_buffer,
-                            value_type *recv_buffer,
-                            const std::uint64_t *send_counts_bytes,
-                            const std::uint64_t *send_offsets_bytes,
-                            const std::uint64_t *remote_recv_offsets_bytes,
-                            std::uint64_t *signals, int rank, int nranks,
-                            std::uint64_t direct_chunk_bytes,
-                            std::uint64_t network_chunk_bytes,
-                            std::uint64_t max_chunks,
-                            std::uint64_t epoch) {
+__global__ void
+send_chunks(const value_type *send_buffer, value_type *recv_buffer,
+            const std::uint64_t *send_counts_bytes,
+            const std::uint64_t *send_offsets_bytes,
+            const std::uint64_t *remote_recv_offsets_bytes,
+            std::uint64_t *signals, int rank, int nranks,
+            std::uint64_t direct_chunk_bytes, std::uint64_t network_chunk_bytes,
+            const nvshmemx_qp_handle_t *network_qps, int network_qp_count,
+            std::uint64_t max_chunks, std::uint64_t epoch) {
   /*
-   * TODO: Assign destination/chunk pairs to CTAs in chunk-major order so
-   * adjacent CTAs start on different destinations. Copy self and directly
-   * accessible messages in direct_chunk_bytes chunks. For another PE, use
-   * nvshmem_ptr to choose a block-scoped NBI put-with-signal for each direct
-   * chunk or a thread-scoped NBI put-with-signal for each larger network chunk.
+   * TODO: Assign rank-rotated destination/chunk pairs to CTAs in chunk-major
+   * order. Copy self and directly accessible messages in direct_chunk_bytes
+   * chunks. For another PE, use nvshmem_ptr to choose a block-scoped NBI
+   * put-with-signal for each direct chunk or a QP-specific thread-scoped NBI
+   * put-with-signal for each larger network chunk. Select the network QP from
+   * both the destination and chunk index.
    */
   (void)send_buffer;
   (void)recv_buffer;
@@ -87,6 +87,8 @@ __global__ void send_chunks(const value_type *send_buffer,
   (void)nranks;
   (void)direct_chunk_bytes;
   (void)network_chunk_bytes;
+  (void)network_qps;
+  (void)network_qp_count;
   (void)max_chunks;
   (void)epoch;
 }
@@ -97,6 +99,7 @@ __global__ void wait_for_chunks(const std::uint64_t *recv_signal_counts,
   /*
    * TODO: Wait for the number of source signals supplied by the route-plan
    * exchange. Direct and network peers signal once per route-specific chunk.
+   * After all waits, quiet every default and custom QP before returning.
    */
   (void)recv_signal_counts;
   (void)signals;
@@ -135,6 +138,36 @@ std::uint64_t chunk_bytes_from_environment(const char *name,
   return bytes;
 }
 
+int network_qp_count_from_environment(int rank) {
+  const char *name = "HOTI_ALLTOALLV_NETWORK_QPS";
+  const char *text = std::getenv(name);
+  char *end = nullptr;
+  long value =
+      text == nullptr ? kDefaultNetworkQpCount : std::strtol(text, &end, 10);
+  if (value < 1 || value > std::numeric_limits<int>::max() ||
+      (text != nullptr && (end == text || *end != '\0'))) {
+    if (rank == 0)
+      std::fprintf(stderr, "%s must be a positive integer\n", name);
+    MPI_Abort(MPI_COMM_WORLD, 1);
+  }
+
+  int count = static_cast<int>(value);
+  int minimum = 0;
+  int maximum = 0;
+  alltoallv::mpi_check(
+      MPI_Allreduce(&count, &minimum, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD),
+      "MPI_Allreduce(QP count minimum)");
+  alltoallv::mpi_check(
+      MPI_Allreduce(&count, &maximum, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD),
+      "MPI_Allreduce(QP count maximum)");
+  if (minimum != maximum) {
+    if (rank == 0)
+      std::fprintf(stderr, "%s must match on every PE\n", name);
+    MPI_Abort(MPI_COMM_WORLD, 1);
+  }
+  return count;
+}
+
 void require_matching_launch(const alltoallv::Options &options, int rank) {
   alltoallv::require_matching_collective_options(options, rank);
 }
@@ -170,16 +203,13 @@ template <typename T> T *symmetric_alloc(std::uint64_t count) {
       nvshmem_malloc(static_cast<std::size_t>(allocation_count) * sizeof(T)));
 }
 
-int launch_plan_exchange(const std::uint64_t *send_counts_bytes,
-                         std::uint64_t *recv_counts_bytes,
-                         std::uint64_t *recv_offsets_bytes,
-                         std::uint64_t *remote_recv_offsets_bytes,
-                         value_type *recv_buffer,
-                         std::uint64_t *send_signal_counts,
-                         std::uint64_t *recv_signal_counts, int rank,
-                         int nranks, std::uint64_t direct_chunk_bytes,
-                         std::uint64_t network_chunk_bytes, int threads,
-                         int *device_status, cudaStream_t stream) {
+int launch_plan_exchange(
+    const std::uint64_t *send_counts_bytes, std::uint64_t *recv_counts_bytes,
+    std::uint64_t *recv_offsets_bytes, std::uint64_t *remote_recv_offsets_bytes,
+    value_type *recv_buffer, std::uint64_t *send_signal_counts,
+    std::uint64_t *recv_signal_counts, int rank, int nranks,
+    std::uint64_t direct_chunk_bytes, std::uint64_t network_chunk_bytes,
+    int threads, int *device_status, cudaStream_t stream) {
   void *args[] = {&send_counts_bytes,
                   &recv_counts_bytes,
                   &recv_offsets_bytes,
@@ -232,11 +262,10 @@ int validate_device_plan(const alltoallv::Plan &plan,
   CUDA_CHECK(cudaMemcpy(recv_signal_count.data(), recv_signal_counts,
                         plan.size * sizeof(std::uint64_t),
                         cudaMemcpyDeviceToHost));
-  alltoallv::mpi_check(
-      MPI_Alltoall(send_signal_count.data(), 1, MPI_UINT64_T,
-                   expected_recv_signal_count.data(), 1, MPI_UINT64_T,
-                   MPI_COMM_WORLD),
-      "MPI_Alltoall(signal count validation)");
+  alltoallv::mpi_check(MPI_Alltoall(send_signal_count.data(), 1, MPI_UINT64_T,
+                                    expected_recv_signal_count.data(), 1,
+                                    MPI_UINT64_T, MPI_COMM_WORLD),
+                       "MPI_Alltoall(signal count validation)");
 
   int local_errors = 0;
   for (int peer = 0; peer < plan.size; ++peer) {
@@ -270,8 +299,10 @@ void launch_alltoallv(const value_type *send_buffer, value_type *recv_buffer,
                       std::uint64_t *signals, int rank, int nranks,
                       std::uint64_t direct_chunk_bytes,
                       std::uint64_t network_chunk_bytes,
-                      std::uint64_t max_chunks, std::uint64_t epoch,
-                      const alltoallv::Options &options, cudaStream_t stream) {
+                      const nvshmemx_qp_handle_t *network_qps,
+                      int network_qp_count, std::uint64_t max_chunks,
+                      std::uint64_t epoch, const alltoallv::Options &options,
+                      cudaStream_t stream) {
   int unused = 0;
   void *begin_args[] = {&unused};
   int begin_status = nvshmemx_collective_launch(
@@ -285,10 +316,10 @@ void launch_alltoallv(const value_type *send_buffer, value_type *recv_buffer,
   send_chunks<<<options.blocks, options.threads, 0, stream>>>(
       send_buffer, recv_buffer, send_counts_bytes, send_offsets_bytes,
       remote_recv_offsets_bytes, signals, rank, nranks, direct_chunk_bytes,
-      network_chunk_bytes, max_chunks, epoch);
+      network_chunk_bytes, network_qps, network_qp_count, max_chunks, epoch);
   CUDA_CHECK(cudaGetLastError());
-  void *args[] = {&recv_signal_counts, &signals, &rank, &nranks, &max_chunks,
-                  &epoch};
+  void *args[] = {&recv_signal_counts, &signals, &rank, &nranks,
+                  &max_chunks,         &epoch};
   int wait_status = nvshmemx_collective_launch(
       reinterpret_cast<const void *>(wait_for_chunks), dim3(1),
       dim3(options.threads), args, 0, stream);
@@ -306,8 +337,8 @@ void free_allocations(value_type *send_buffer, value_type *recv_buffer,
                       std::uint64_t *recv_offsets_bytes,
                       std::uint64_t *remote_recv_offsets_bytes,
                       std::uint64_t *send_signal_counts,
-                      std::uint64_t *recv_signal_counts,
-                      std::uint64_t *signals, int *device_status) {
+                      std::uint64_t *recv_signal_counts, std::uint64_t *signals,
+                      int *device_status, nvshmemx_qp_handle_t *network_qps) {
   nvshmem_free(send_buffer);
   nvshmem_free(recv_buffer);
   nvshmem_free(send_counts_bytes);
@@ -319,6 +350,7 @@ void free_allocations(value_type *send_buffer, value_type *recv_buffer,
   nvshmem_free(recv_signal_counts);
   nvshmem_free(signals);
   CUDA_CHECK(cudaFree(device_status));
+  CUDA_CHECK(cudaFree(network_qps));
 }
 
 } // namespace
@@ -343,9 +375,10 @@ int main(int argc, char **argv) {
 
   std::uint64_t direct_chunk_bytes = chunk_bytes_from_environment(
       "HOTI_ALLTOALLV_CHUNK_BYTES", kDefaultDirectChunkBytes, context.rank);
-  std::uint64_t network_chunk_bytes = chunk_bytes_from_environment(
-      "HOTI_ALLTOALLV_NETWORK_CHUNK_BYTES", kDefaultNetworkChunkBytes,
-      context.rank);
+  std::uint64_t network_chunk_bytes =
+      chunk_bytes_from_environment("HOTI_ALLTOALLV_NETWORK_CHUNK_BYTES",
+                                   kDefaultNetworkChunkBytes, context.rank);
+  int network_qp_count = network_qp_count_from_environment(context.rank);
   std::uint64_t max_pair_bytes = plan.max_pair_count * sizeof(value_type);
   std::uint64_t smallest_chunk_bytes =
       std::min(direct_chunk_bytes, network_chunk_bytes);
@@ -359,6 +392,20 @@ int main(int argc, char **argv) {
   }
   std::uint64_t signal_count =
       static_cast<std::uint64_t>(context.size) * max_chunks;
+
+  nvshmemx_qp_handle_t *host_network_qps = nullptr;
+  int qp_status = nvshmemx_qp_create(network_qp_count, &host_network_qps);
+  if (qp_status != NVSHMEMX_SUCCESS || host_network_qps == nullptr) {
+    if (context.rank == 0)
+      std::fprintf(stderr, "NVSHMEM network QP creation failed: %d\n",
+                   qp_status);
+    MPI_Abort(MPI_COMM_WORLD, qp_status == 0 ? 1 : qp_status);
+  }
+  nvshmemx_qp_handle_t *network_qps = nullptr;
+  CUDA_CHECK(cudaMalloc(&network_qps, network_qp_count * sizeof(*network_qps)));
+  CUDA_CHECK(cudaMemcpy(network_qps, host_network_qps,
+                        network_qp_count * sizeof(*network_qps),
+                        cudaMemcpyHostToDevice));
 
   value_type *send_buffer =
       symmetric_alloc<value_type>(plan.global_send_capacity);
@@ -443,11 +490,7 @@ int main(int argc, char **argv) {
     if (context.rank == 0)
       std::fprintf(stderr, "NVSHMEM device plan exchange failed: %d\n",
                    plan_status);
-    free_allocations(send_buffer, recv_buffer, send_counts_bytes,
-                     send_offsets_bytes, recv_counts_bytes, recv_offsets_bytes,
-                     remote_recv_offsets_bytes, send_signal_counts,
-                     recv_signal_counts, signals, device_status);
-    exercise_finalize(&context);
+    MPI_Abort(MPI_COMM_WORLD, 1);
     return 1;
   }
   if (validate_device_plan(plan, recv_counts_bytes, recv_offsets_bytes,
@@ -456,8 +499,9 @@ int main(int argc, char **argv) {
     free_allocations(send_buffer, recv_buffer, send_counts_bytes,
                      send_offsets_bytes, recv_counts_bytes, recv_offsets_bytes,
                      remote_recv_offsets_bytes, send_signal_counts,
-                     recv_signal_counts, signals, device_status);
+                     recv_signal_counts, signals, device_status, network_qps);
     exercise_finalize(&context);
+    std::free(host_network_qps);
     return 1;
   }
 
@@ -465,14 +509,21 @@ int main(int argc, char **argv) {
     std::printf("NVSHMEM chunk sizes: direct=%llu bytes, network=%llu bytes\n",
                 static_cast<unsigned long long>(direct_chunk_bytes),
                 static_cast<unsigned long long>(network_chunk_bytes));
+  if (context.rank == 0) {
+    int explicit_qps = 0;
+    for (int index = 0; index < network_qp_count; ++index)
+      explicit_qps += host_network_qps[index] != NVSHMEMX_QP_DEFAULT;
+    std::printf("NVSHMEM network QPs: requested=%d, explicit=%d\n",
+                network_qp_count, explicit_qps);
+  }
   print_route_summary(recv_buffer, context.rank, context.size);
 
   std::uint64_t epoch = 1;
   launch_alltoallv(
       send_buffer, recv_buffer, send_counts_bytes, send_offsets_bytes,
       recv_signal_counts, remote_recv_offsets_bytes, signals, context.rank,
-      context.size, direct_chunk_bytes, network_chunk_bytes, max_chunks,
-      epoch++, options, context.stream);
+      context.size, direct_chunk_bytes, network_chunk_bytes, network_qps,
+      network_qp_count, max_chunks, epoch++, options, context.stream);
   CUDA_CHECK(cudaStreamSynchronize(context.stream));
 
   std::vector<value_type> observed(plan.global_recv_capacity);
@@ -484,17 +535,18 @@ int main(int argc, char **argv) {
     free_allocations(send_buffer, recv_buffer, send_counts_bytes,
                      send_offsets_bytes, recv_counts_bytes, recv_offsets_bytes,
                      remote_recv_offsets_bytes, send_signal_counts,
-                     recv_signal_counts, signals, device_status);
+                     recv_signal_counts, signals, device_status, network_qps);
     exercise_finalize(&context);
+    std::free(host_network_qps);
     return 1;
   }
 
   for (int iteration = 0; iteration < options.warmup; ++iteration) {
-    launch_alltoallv(send_buffer, recv_buffer, send_counts_bytes,
-                     send_offsets_bytes, recv_signal_counts,
-                     remote_recv_offsets_bytes, signals, context.rank,
-                     context.size, direct_chunk_bytes, network_chunk_bytes,
-                     max_chunks, epoch++, options, context.stream);
+    launch_alltoallv(
+        send_buffer, recv_buffer, send_counts_bytes, send_offsets_bytes,
+        recv_signal_counts, remote_recv_offsets_bytes, signals, context.rank,
+        context.size, direct_chunk_bytes, network_chunk_bytes, network_qps,
+        network_qp_count, max_chunks, epoch++, options, context.stream);
   }
   CUDA_CHECK(cudaStreamSynchronize(context.stream));
   alltoallv::mpi_check(MPI_Barrier(MPI_COMM_WORLD), "MPI_Barrier(timing)");
@@ -505,11 +557,11 @@ int main(int argc, char **argv) {
   CUDA_CHECK(cudaEventCreate(&stop));
   CUDA_CHECK(cudaEventRecord(start, context.stream));
   for (int iteration = 0; iteration < options.iterations; ++iteration) {
-    launch_alltoallv(send_buffer, recv_buffer, send_counts_bytes,
-                     send_offsets_bytes, recv_signal_counts,
-                     remote_recv_offsets_bytes, signals, context.rank,
-                     context.size, direct_chunk_bytes, network_chunk_bytes,
-                     max_chunks, epoch++, options, context.stream);
+    launch_alltoallv(
+        send_buffer, recv_buffer, send_counts_bytes, send_offsets_bytes,
+        recv_signal_counts, remote_recv_offsets_bytes, signals, context.rank,
+        context.size, direct_chunk_bytes, network_chunk_bytes, network_qps,
+        network_qp_count, max_chunks, epoch++, options, context.stream);
   }
   CUDA_CHECK(cudaEventRecord(stop, context.stream));
   CUDA_CHECK(cudaEventSynchronize(stop));
@@ -525,8 +577,8 @@ int main(int argc, char **argv) {
   launch_alltoallv(
       send_buffer, recv_buffer, send_counts_bytes, send_offsets_bytes,
       recv_signal_counts, remote_recv_offsets_bytes, signals, context.rank,
-      context.size, direct_chunk_bytes, network_chunk_bytes, max_chunks,
-      epoch++, options, context.stream);
+      context.size, direct_chunk_bytes, network_chunk_bytes, network_qps,
+      network_qp_count, max_chunks, epoch++, options, context.stream);
   CUDA_CHECK(cudaStreamSynchronize(context.stream));
   CUDA_CHECK(cudaMemcpy(observed.data(), recv_buffer,
                         plan.global_recv_capacity * sizeof(value_type),
@@ -536,15 +588,17 @@ int main(int argc, char **argv) {
     free_allocations(send_buffer, recv_buffer, send_counts_bytes,
                      send_offsets_bytes, recv_counts_bytes, recv_offsets_bytes,
                      remote_recv_offsets_bytes, send_signal_counts,
-                     recv_signal_counts, signals, device_status);
+                     recv_signal_counts, signals, device_status, network_qps);
     exercise_finalize(&context);
+    std::free(host_network_qps);
     return 1;
   }
 
   free_allocations(send_buffer, recv_buffer, send_counts_bytes,
                    send_offsets_bytes, recv_counts_bytes, recv_offsets_bytes,
                    remote_recv_offsets_bytes, send_signal_counts,
-                   recv_signal_counts, signals, device_status);
+                   recv_signal_counts, signals, device_status, network_qps);
   exercise_finalize(&context);
+  std::free(host_network_qps);
   return 0;
 }
