@@ -17,7 +17,8 @@ namespace {
 
 using alltoallv::value_type;
 
-constexpr std::uint64_t kDefaultChunkBytes = 64ull << 10;
+constexpr std::uint64_t kDefaultDirectChunkBytes = 256ull << 10;
+constexpr std::uint64_t kDefaultNetworkChunkBytes = 4ull << 20;
 constexpr std::uint64_t kMetadataAlignment = 16;
 
 __device__ std::uint64_t align_bytes(std::uint64_t value) {
@@ -33,15 +34,16 @@ __global__ void exchange_plan(const std::uint64_t *send_counts_bytes,
                               value_type *recv_buffer,
                               std::uint64_t *send_signal_counts,
                               std::uint64_t *recv_signal_counts, int rank,
-                              int nranks, std::uint64_t chunk_bytes,
+                              int nranks, std::uint64_t direct_chunk_bytes,
+                              std::uint64_t network_chunk_bytes,
                               int *status) {
   /*
    * TODO: Exchange send_counts_bytes with a block-scoped NVSHMEM all-to-all,
    * build the aligned receive offsets, and exchange those offsets back to the
    * senders. Then classify each outgoing route with nvshmem_ptr, calculate
-   * the number of signals that route will produce, and exchange those counts
-   * with a third block-scoped all-to-all. Store the collective status in
-   * status.
+   * the number of direct or network chunks that route will produce, and
+   * exchange those signal counts with a third block-scoped all-to-all. Store
+   * the collective status in status.
    */
   (void)send_counts_bytes;
   (void)recv_counts_bytes;
@@ -52,7 +54,8 @@ __global__ void exchange_plan(const std::uint64_t *send_counts_bytes,
   (void)recv_signal_counts;
   (void)rank;
   (void)nranks;
-  (void)chunk_bytes;
+  (void)direct_chunk_bytes;
+  (void)network_chunk_bytes;
   if (threadIdx.x == 0)
     *status = -1;
 }
@@ -63,14 +66,16 @@ __global__ void send_chunks(const value_type *send_buffer,
                             const std::uint64_t *send_offsets_bytes,
                             const std::uint64_t *remote_recv_offsets_bytes,
                             std::uint64_t *signals, int rank, int nranks,
-                            std::uint64_t chunk_bytes, std::uint64_t max_chunks,
+                            std::uint64_t direct_chunk_bytes,
+                            std::uint64_t network_chunk_bytes,
+                            std::uint64_t max_chunks,
                             std::uint64_t epoch) {
   /*
    * TODO: Assign destination/chunk pairs to CTAs in chunk-major order so
    * adjacent CTAs start on different destinations. Copy self and directly
-   * accessible messages in chunks. For another PE, use nvshmem_ptr to choose
-   * a block-scoped put-with-signal for each direct chunk or one thread-scoped
-   * put-with-signal for the complete network message.
+   * accessible messages in direct_chunk_bytes chunks. For another PE, use
+   * nvshmem_ptr to choose a block-scoped put-with-signal for each direct chunk
+   * or a thread-scoped put-with-signal for each larger network chunk.
    */
   (void)send_buffer;
   (void)recv_buffer;
@@ -80,7 +85,8 @@ __global__ void send_chunks(const value_type *send_buffer,
   (void)signals;
   (void)rank;
   (void)nranks;
-  (void)chunk_bytes;
+  (void)direct_chunk_bytes;
+  (void)network_chunk_bytes;
   (void)max_chunks;
   (void)epoch;
 }
@@ -90,8 +96,7 @@ __global__ void wait_for_chunks(const std::uint64_t *recv_signal_counts,
                                 std::uint64_t max_chunks, std::uint64_t epoch) {
   /*
    * TODO: Wait for the number of source signals supplied by the route-plan
-   * exchange. Direct peers signal once per chunk; a network peer signals once
-   * for its complete message.
+   * exchange. Direct and network peers signal once per route-specific chunk.
    */
   (void)recv_signal_counts;
   (void)signals;
@@ -101,15 +106,15 @@ __global__ void wait_for_chunks(const std::uint64_t *recv_signal_counts,
   (void)epoch;
 }
 
-std::uint64_t chunk_bytes_from_environment(int rank) {
-  const char *text = std::getenv("HOTI_ALLTOALLV_CHUNK_BYTES");
+std::uint64_t chunk_bytes_from_environment(const char *name,
+                                           std::uint64_t default_bytes,
+                                           int rank) {
+  const char *text = std::getenv(name);
   std::uint64_t bytes =
-      text == nullptr ? kDefaultChunkBytes : alltoallv::parse_bytes(text);
+      text == nullptr ? default_bytes : alltoallv::parse_bytes(text);
   if (bytes == 0 || bytes % kMetadataAlignment != 0) {
     if (rank == 0)
-      std::fprintf(stderr,
-                   "HOTI_ALLTOALLV_CHUNK_BYTES must be a positive multiple "
-                   "of %llu\n",
+      std::fprintf(stderr, "%s must be a positive multiple of %llu\n", name,
                    static_cast<unsigned long long>(kMetadataAlignment));
     MPI_Abort(MPI_COMM_WORLD, 1);
   }
@@ -124,8 +129,7 @@ std::uint64_t chunk_bytes_from_environment(int rank) {
       "MPI_Allreduce(chunk maximum)");
   if (minimum != maximum) {
     if (rank == 0)
-      std::fprintf(stderr,
-                   "HOTI_ALLTOALLV_CHUNK_BYTES must match on every PE\n");
+      std::fprintf(stderr, "%s must match on every PE\n", name);
     MPI_Abort(MPI_COMM_WORLD, 1);
   }
   return bytes;
@@ -173,7 +177,8 @@ int launch_plan_exchange(const std::uint64_t *send_counts_bytes,
                          value_type *recv_buffer,
                          std::uint64_t *send_signal_counts,
                          std::uint64_t *recv_signal_counts, int rank,
-                         int nranks, std::uint64_t chunk_bytes, int threads,
+                         int nranks, std::uint64_t direct_chunk_bytes,
+                         std::uint64_t network_chunk_bytes, int threads,
                          int *device_status, cudaStream_t stream) {
   void *args[] = {&send_counts_bytes,
                   &recv_counts_bytes,
@@ -184,7 +189,8 @@ int launch_plan_exchange(const std::uint64_t *send_counts_bytes,
                   &recv_signal_counts,
                   &rank,
                   &nranks,
-                  &chunk_bytes,
+                  &direct_chunk_bytes,
+                  &network_chunk_bytes,
                   &device_status};
   int status =
       nvshmemx_collective_launch(reinterpret_cast<const void *>(exchange_plan),
@@ -262,9 +268,10 @@ void launch_alltoallv(const value_type *send_buffer, value_type *recv_buffer,
                       const std::uint64_t *recv_signal_counts,
                       const std::uint64_t *remote_recv_offsets_bytes,
                       std::uint64_t *signals, int rank, int nranks,
-                      std::uint64_t chunk_bytes, std::uint64_t max_chunks,
-                      std::uint64_t epoch, const alltoallv::Options &options,
-                      cudaStream_t stream) {
+                      std::uint64_t direct_chunk_bytes,
+                      std::uint64_t network_chunk_bytes,
+                      std::uint64_t max_chunks, std::uint64_t epoch,
+                      const alltoallv::Options &options, cudaStream_t stream) {
   int unused = 0;
   void *begin_args[] = {&unused};
   int begin_status = nvshmemx_collective_launch(
@@ -277,8 +284,8 @@ void launch_alltoallv(const value_type *send_buffer, value_type *recv_buffer,
   }
   send_chunks<<<options.blocks, options.threads, 0, stream>>>(
       send_buffer, recv_buffer, send_counts_bytes, send_offsets_bytes,
-      remote_recv_offsets_bytes, signals, rank, nranks, chunk_bytes, max_chunks,
-      epoch);
+      remote_recv_offsets_bytes, signals, rank, nranks, direct_chunk_bytes,
+      network_chunk_bytes, max_chunks, epoch);
   CUDA_CHECK(cudaGetLastError());
   void *args[] = {&recv_signal_counts, &signals, &rank, &nranks, &max_chunks,
                   &epoch};
@@ -334,10 +341,16 @@ int main(int argc, char **argv) {
       alltoallv::make_plan(context.rank, context.size, options);
   alltoallv::print_plan(plan, options, "NVSHMEM AlltoAllV");
 
-  std::uint64_t chunk_bytes = chunk_bytes_from_environment(context.rank);
+  std::uint64_t direct_chunk_bytes = chunk_bytes_from_environment(
+      "HOTI_ALLTOALLV_CHUNK_BYTES", kDefaultDirectChunkBytes, context.rank);
+  std::uint64_t network_chunk_bytes = chunk_bytes_from_environment(
+      "HOTI_ALLTOALLV_NETWORK_CHUNK_BYTES", kDefaultNetworkChunkBytes,
+      context.rank);
   std::uint64_t max_pair_bytes = plan.max_pair_count * sizeof(value_type);
+  std::uint64_t smallest_chunk_bytes =
+      std::min(direct_chunk_bytes, network_chunk_bytes);
   std::uint64_t max_chunks = std::max<std::uint64_t>(
-      1, (max_pair_bytes + chunk_bytes - 1) / chunk_bytes);
+      1, (max_pair_bytes + smallest_chunk_bytes - 1) / smallest_chunk_bytes);
   if (max_chunks > std::numeric_limits<std::uint64_t>::max() /
                        static_cast<std::uint64_t>(context.size)) {
     if (context.rank == 0)
@@ -424,8 +437,8 @@ int main(int argc, char **argv) {
   int plan_status = launch_plan_exchange(
       send_counts_bytes, recv_counts_bytes, recv_offsets_bytes,
       remote_recv_offsets_bytes, recv_buffer, send_signal_counts,
-      recv_signal_counts, context.rank, context.size, chunk_bytes,
-      options.threads, device_status, context.stream);
+      recv_signal_counts, context.rank, context.size, direct_chunk_bytes,
+      network_chunk_bytes, options.threads, device_status, context.stream);
   if (plan_status != 0) {
     if (context.rank == 0)
       std::fprintf(stderr, "NVSHMEM device plan exchange failed: %d\n",
@@ -449,15 +462,17 @@ int main(int argc, char **argv) {
   }
 
   if (context.rank == 0)
-    std::printf("NVSHMEM chunk size: %llu bytes\n",
-                static_cast<unsigned long long>(chunk_bytes));
+    std::printf("NVSHMEM chunk sizes: direct=%llu bytes, network=%llu bytes\n",
+                static_cast<unsigned long long>(direct_chunk_bytes),
+                static_cast<unsigned long long>(network_chunk_bytes));
   print_route_summary(recv_buffer, context.rank, context.size);
 
   std::uint64_t epoch = 1;
   launch_alltoallv(
       send_buffer, recv_buffer, send_counts_bytes, send_offsets_bytes,
       recv_signal_counts, remote_recv_offsets_bytes, signals, context.rank,
-      context.size, chunk_bytes, max_chunks, epoch++, options, context.stream);
+      context.size, direct_chunk_bytes, network_chunk_bytes, max_chunks,
+      epoch++, options, context.stream);
   CUDA_CHECK(cudaStreamSynchronize(context.stream));
 
   std::vector<value_type> observed(plan.global_recv_capacity);
@@ -478,8 +493,8 @@ int main(int argc, char **argv) {
     launch_alltoallv(send_buffer, recv_buffer, send_counts_bytes,
                      send_offsets_bytes, recv_signal_counts,
                      remote_recv_offsets_bytes, signals, context.rank,
-                     context.size, chunk_bytes, max_chunks, epoch++, options,
-                     context.stream);
+                     context.size, direct_chunk_bytes, network_chunk_bytes,
+                     max_chunks, epoch++, options, context.stream);
   }
   CUDA_CHECK(cudaStreamSynchronize(context.stream));
   alltoallv::mpi_check(MPI_Barrier(MPI_COMM_WORLD), "MPI_Barrier(timing)");
@@ -493,8 +508,8 @@ int main(int argc, char **argv) {
     launch_alltoallv(send_buffer, recv_buffer, send_counts_bytes,
                      send_offsets_bytes, recv_signal_counts,
                      remote_recv_offsets_bytes, signals, context.rank,
-                     context.size, chunk_bytes, max_chunks, epoch++, options,
-                     context.stream);
+                     context.size, direct_chunk_bytes, network_chunk_bytes,
+                     max_chunks, epoch++, options, context.stream);
   }
   CUDA_CHECK(cudaEventRecord(stop, context.stream));
   CUDA_CHECK(cudaEventSynchronize(stop));
@@ -510,7 +525,8 @@ int main(int argc, char **argv) {
   launch_alltoallv(
       send_buffer, recv_buffer, send_counts_bytes, send_offsets_bytes,
       recv_signal_counts, remote_recv_offsets_bytes, signals, context.rank,
-      context.size, chunk_bytes, max_chunks, epoch++, options, context.stream);
+      context.size, direct_chunk_bytes, network_chunk_bytes, max_chunks,
+      epoch++, options, context.stream);
   CUDA_CHECK(cudaStreamSynchronize(context.stream));
   CUDA_CHECK(cudaMemcpy(observed.data(), recv_buffer,
                         plan.global_recv_capacity * sizeof(value_type),
