@@ -45,10 +45,10 @@ __device__ int route_shard_block(
     int source_node, int destination_node, int destination_local,
     int node_count, int local_count, int shard, int route_shards,
     int blocks) {
+  const int node_delta =
+      (destination_node - source_node + node_count) % node_count;
   const std::uint64_t route =
-      (static_cast<std::uint64_t>(source_node) * node_count +
-       destination_node) *
-          local_count +
+      static_cast<std::uint64_t>(node_delta - 1) * local_count +
       destination_local;
   return static_cast<int>((route * route_shards + shard) % blocks);
 }
@@ -122,6 +122,8 @@ __global__ void send_and_deliver_local(
           static_cast<int>(dev_comm.ginContextCount));
   const int context =
       static_cast<int>(blockIdx.x) * context_count / gridDim.x;
+  const ncclGinSignal_t signal =
+      static_cast<ncclGinSignal_t>(blockIdx.x);
   ncclGin gin{dev_comm, context};
   ncclBarrierSession<ncclCoopCta> barrier{
       ncclCoopCta(), ncclTeamTagWorld(), gin, blockIdx.x};
@@ -174,20 +176,14 @@ __global__ void send_and_deliver_local(
         const std::size_t inbox_offset =
             rail.rank * node_bytes + destination_local * slot_bytes +
             offset * sizeof(value_type);
-        gin.put(rail, destination_node, inbox_window, inbox_offset,
-                send_window,
+        gin.put(rail, destination_node, inbox_window, inbox_offset, send_window,
                 (entry.send_offset + offset) * sizeof(value_type),
                 count * sizeof(value_type),
-                ncclGin_WeakSignalInc{
-                    static_cast<ncclGinSignal_t>(blockIdx.x)});
+                ncclGin_WeakSignalInc{signal});
       }
     }
   }
   __syncthreads();
-  gin.flush(ncclCoopCta());
-
-  barrier.sync(ncclCoopCta(), cuda::memory_order_release,
-               ncclGinFenceLevel::None);
 #endif
 }
 
@@ -202,6 +198,8 @@ __global__ void wait_and_scatter(
           static_cast<int>(dev_comm.ginContextCount));
   const int context =
       static_cast<int>(blockIdx.x) * context_count / gridDim.x;
+  const ncclGinSignal_t signal =
+      static_cast<ncclGinSignal_t>(blockIdx.x);
   ncclGin gin{dev_comm, context};
   ncclBarrierSession<ncclCoopCta> barrier{
       ncclCoopCta(), ncclTeamTagWorld(), gin, blockIdx.x};
@@ -237,13 +235,12 @@ __global__ void wait_and_scatter(
   }
   __syncthreads();
   if (expected != 0) {
-    gin.waitSignal(
-        ncclCoopCta(), static_cast<ncclGinSignal_t>(blockIdx.x),
-        epoch * expected);
+    gin.waitSignal(ncclCoopCta(), signal, epoch * expected);
   }
   scatter_assigned_shards(
       dev_comm, recv_window, plan_window, inbox_window, slot_bytes,
       node_bytes, route_shards);
+  gin.flush(ncclCoopCta());
 
   barrier.sync(ncclCoopCta(), cuda::memory_order_acq_rel,
                ncclGinFenceLevel::None);
@@ -269,13 +266,27 @@ void launch(const alltoallv::nccl_setup::State &state,
 int choose_route_shards(const alltoallv::nccl_setup::State &state,
                         const alltoallv::Options &options,
                         const alltoallv::Plan &plan) {
-  constexpr std::uint64_t kTargetBytes = 4ull << 20;
+  constexpr std::uint64_t kTargetBytes = 1ull << 20;
   const int remote_routes =
       (state.rail_team.nRanks - 1) * state.lsa_team.nRanks;
-  const int route_capacity =
+  std::uint64_t local_max_pair = 0;
+  for (int peer = 0; peer < plan.size; ++peer) {
+    if (plan.node_roots[peer] != plan.node_roots[plan.rank])
+      local_max_pair = std::max(local_max_pair, plan.send_counts[peer]);
+  }
+  std::uint64_t max_pair_count = 0;
+  alltoallv::mpi_check(
+      MPI_Allreduce(&local_max_pair, &max_pair_count, 1, MPI_UINT64_T,
+                    MPI_MAX, MPI_COMM_WORLD),
+      "MPI_Allreduce(max network pair count)");
+  const bool heavy_route =
+      max_pair_count != 0 &&
+      max_pair_count >= (plan.max_network_send_elements + 1) / 2;
+  const int balanced_capacity =
       std::max(1, options.blocks / remote_routes);
-  const std::uint64_t max_pair_bytes =
-      plan.max_pair_count * sizeof(value_type);
+  const int route_capacity =
+      heavy_route ? options.blocks : balanced_capacity;
+  const std::uint64_t max_pair_bytes = max_pair_count * sizeof(value_type);
   const std::uint64_t size_shards = std::max<std::uint64_t>(
       1, (max_pair_bytes + kTargetBytes - 1) / kTargetBytes);
   return static_cast<int>(std::min<std::uint64_t>(route_capacity,

@@ -46,17 +46,23 @@ rail GPU 2 sends only to rail GPU 2.
 
 Large messages are divided into shards inside that slot. Shard boundaries are
 16-byte aligned, and the last shard owns any scalar tail. The host aims for
-about 4 MiB per shard but never creates more shards than the CTA grid can
-spread across the remote routes:
+about 1 MiB per shard. For balanced traffic, it reserves a share of the CTA
+grid for every remote route:
 
 ```text
 route_shards = min(
     max(1, blocks / remote_routes),
-    max(1, ceil(largest_pair_bytes / 4 MiB)))
+    max(1, ceil(largest_remote_pair_bytes / 1 MiB)))
 ```
 
-Small messages therefore stay as one put per route. Larger messages can use
-several GIN contexts without changing the inbox allocation or adding headers.
+That cap leaves room for all routes to make progress. It is too conservative
+when the largest remote pair is at least half of the largest per-rank remote
+send volume. For that case, the cap becomes `blocks`, allowing the hot route to
+use the whole grid. `route_shards` is one global value, so this also raises the
+shard count for the other remote routes; zero-length shards do not issue puts.
+The calculation happens once on the host, outside the timed region. Small
+messages still use one put per route, and sharding does not change the inbox
+allocation or add headers.
 
 The ingress GPU needs the receive offset chosen by each final local GPU. It
 reads that GPU's registered plan through `ncclGetLsaPointer(plan_window, ...)`,
@@ -65,15 +71,18 @@ then indexes the plan by the source world rank.
 ## CTAs, contexts, and signals
 
 GIN signals belong to a GIN context. A sender and receiver must therefore use
-the same context for a shard. The helper `route_shard_block` maps
+the same context for a shard. The helper `route_shard_block` first computes
+the forward node distance:
 
 ```text
-(source node, destination node, destination LSA rank, shard)
-    -> CTA -> GIN context
+node_delta = (destination_node - source_node + node_count) % node_count
 ```
 
-the same way on both sides. The signal index is `blockIdx.x` within that
-matched context.
+It then maps `(node_delta - 1, destination LSA rank, shard)` to a CTA and GIN
+context. Using the relative node distance instead of an absolute
+source/destination pair gives every source node the same spread across the CTA
+grid. The sender and receiver calculate the same CTA. The signal index is
+`blockIdx.x` within that matched context.
 
 The host requests one GIN context per CTA. The kernel uses
 `dev_comm.ginContextCount` because NCCL may create fewer contexts than were
@@ -90,10 +99,12 @@ ncclDevCommCreate(comm, &requirements, &dev_comm);
 
 The launch is split into two kernels:
 
-1. `send_and_deliver_local` copies same-node messages with LSA pointers,
-   issues the remote shard puts, and flushes every issuing context.
+1. `send_and_deliver_local` enters a per-CTA world barrier, copies same-node
+   messages with LSA pointers, and issues the remote shard puts.
 2. `wait_and_scatter` counts the non-empty incoming shards assigned to each
-   CTA, waits once for all of them, and copies them to the final local GPUs.
+   CTA, waits once for all of them, copies them to the final local GPUs,
+   flushes the same GIN context's outgoing puts, and enters the final world
+   barrier.
 
 Keeping the sends in a kernel with no remote waits avoids filling the GPU with
 waiting CTAs before all producer CTAs have run.
@@ -104,10 +115,13 @@ increments on every launch. At epoch `e`, it waits for
 `e * expected_nonempty_shards`. An empty shard neither signals nor contributes
 to that threshold.
 
-The weak signal makes its own inbox shard visible to the receiver.
-`gin.flush` is separate: it makes the sender's source range safe to reuse. The
-closing world barrier runs after every LSA scatter and completes the collective
-before the next launch can reuse an inbox slot.
+The weak signal makes its own inbox shard visible before the receiver observes
+the increment. It does not make the sender's source range safe to reuse;
+`gin.flush` provides that local completion guarantee. The flush is delayed
+until the second kernel so outgoing puts can remain in flight while the CTA
+waits for and scatters incoming data. The final world barrier runs after every
+CTA has flushed its outgoing context and completed its LSA scatter. The next
+launch can then reuse the send buffer and inbox slots.
 
 The main device APIs are:
 
@@ -153,9 +167,9 @@ Open `nccl_lsa_gin_alltoallv.cu` and complete its three TODOs:
    helper that scatters its assigned shards through LSA pointers.
 
 The starter supplies the topology mapping, shard calculation, symmetric
-allocation, registered windows, GIN-context mapping, barriers, flushes,
-scatter traversal, launch loop, timing, and validation. The reference is
-`nccl_lsa_gin_alltoallv_SOLVED.cu`.
+allocation, registered windows, GIN-context mapping, barriers, source-reuse
+flush, scatter traversal, launch loop, timing, and validation. The reference
+is `nccl_lsa_gin_alltoallv_SOLVED.cu`.
 
 ## Build and run
 
@@ -179,12 +193,13 @@ Use the same workload controls as the other labs:
 ```bash
 make run_SOLVED NP=8 \
   LAUNCHER='srun --nodes=2 --ntasks=8 --ntasks-per-node=4 --gpus-per-task=1' \
-  RUN_ARGS='--pattern sparse --bytes-per-rank 64M --blocks 16 --iters 50'
+  RUN_ARGS='--pattern sparse --bytes-per-rank 64M --blocks 40 --threads 512 --iters 50'
 ```
 
 CTA count affects both the LSA copy and the requested GIN-context count. Start
-with the default for small messages and measure `--blocks 16` and `--blocks
-64` for larger messages.
+with the default for small messages. In our 64 MiB-per-rank development runs,
+`--blocks 40 --threads 512` performed well; treat that as a starting point and
+measure again on the tutorial system.
 
 The program prints `SKIP` if the placement does not form uniform LSA and rail
 teams or if railed GIN is unavailable. For performance comparisons, use the
