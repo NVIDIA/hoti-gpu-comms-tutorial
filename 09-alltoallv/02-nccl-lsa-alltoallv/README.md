@@ -34,9 +34,11 @@ For each LSA peer, the kernel:
 3. gets the destination address with `ncclGetLsaPointer`;
 4. copies aligned 16-byte vectors, followed by any remaining elements.
 
-Each source begins with its own LSA rank and then wraps around the team. At a
-given step, different sources therefore write different destinations instead
-of creating a synchronized incast on one GPU.
+The peer order is offset by both the source rank and the CTA index. At a given
+step, different sources write different destinations, and different CTAs do
+not all work on the same peer at once. This matters because every CTA owns a
+different slice of every message; changing the visit order does not change
+which bytes it copies.
 
 The kernel uses one LSA barrier per CTA. The acquire barrier at entry ensures
 that every rank has entered the operation before stores begin. The release
@@ -106,8 +108,13 @@ Change the traffic pattern and payload with `RUN_ARGS`:
 ```bash
 make run_SOLVED NP=4 \
   LAUNCHER="srun --nodes=1 --ntasks=4 --gpus-per-task=1" \
-  RUN_ARGS="--pattern sparse --bytes-per-rank 16M --warmup 10 --iters 50"
+  RUN_ARGS="--pattern sparse --bytes-per-rank 16M --blocks 128 --warmup 10 --iters 50"
 ```
+
+For large messages, CTA count controls how finely each peer segment is split.
+Start with `--blocks 128` and measure; a small grid can leave much of the
+NVLink copy bandwidth unused, while the best value depends on the GPU and
+message size.
 
 If the communicator is not one LSA domain, the program prints `SKIP` rather
 than attempting invalid peer accesses. A successful run ends with output like:
