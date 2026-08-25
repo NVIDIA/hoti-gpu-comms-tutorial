@@ -46,9 +46,10 @@ There are three useful communication scopes in these labs:
 The first two map naturally to a direct algorithm: each rank copies or puts
 one variable-sized message to every destination's advertised receive offset.
 Railed GIN is different. It connects GPU 0 to GPU 0 across nodes, GPU 1 to GPU
-1, and so on. The hybrid implementation first packs messages by destination
-node, sends each packet on the source GPU's rail, and then scatters it with LSA
-on the receiving node.
+1, and so on. The hybrid implementation puts each message into a fixed inbox
+slot on the matching remote GPU, then scatters it with LSA on the receiving
+node. Large messages are sharded across GIN contexts while keeping the same
+slot layout.
 
 The NVSHMEM lab uses one source implementation across these topologies. It
 uses `nvshmem_ptr` to detect direct peer mappings, chooses a block-scoped put
@@ -99,10 +100,9 @@ Use the inter-host rate for an IB comparison only after confirming that the
 chosen ranks are in different NVLink domains. On a multi-node NVLink system,
 two hosts can still have a direct GPU mapping. The combined logical rate from
 a mixed NVLink-plus-IB run is not an IB bandwidth number. The hybrid algorithm
-also reads and writes every remote byte while packing, across the network, and
-again while scattering, so its minimum memory traffic is six bytes per remote
-logical byte. Those serialized copies can be the limit even when the rails are
-not full.
+reads each remote byte for the GIN transfer, writes it to the ingress inbox,
+then reads and writes it once more for the LSA scatter. That extra local hop is
+the cost of rail-only connectivity.
 
 The harness uses MPI only for bootstrap, metadata needed to construct the
 reference answer, error reduction, and benchmark alignment. MPI is not the
@@ -122,7 +122,8 @@ make -C 01-nvshmem-alltoallv run_SOLVED NP=4 \
 
 make -C 02-nccl-lsa-alltoallv
 make -C 02-nccl-lsa-alltoallv run_SOLVED NP=4 \
-  LAUNCHER='srun --nodes=1 --ntasks=4 --gpus-per-task=1'
+  LAUNCHER='srun --nodes=1 --ntasks=4 --gpus-per-task=1' \
+  RUN_ARGS='--blocks 128'
 ```
 
 For an IB-only placement, select one GPU per node and run the NVSHMEM and full

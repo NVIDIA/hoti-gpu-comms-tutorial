@@ -29,11 +29,6 @@ namespace {
 
 using alltoallv::DevicePlanEntry;
 using alltoallv::value_type;
-using alltoallv::nccl_setup::HybridPacketItem;
-
-__device__ std::size_t align_packet_bytes(std::size_t value) {
-  return (value + 15) & ~std::size_t{15};
-}
 
 __device__ void copy_values(const value_type *source, value_type *destination,
                             std::uint64_t count, int thread, int threads) {
@@ -46,25 +41,90 @@ __device__ void copy_values(const value_type *source, value_type *destination,
     destination[i] = source[i];
 }
 
-__device__ std::size_t packet_bytes(const HybridPacketItem *items,
-                                    int item_count,
-                                    std::size_t header_bytes) {
-  std::size_t bytes = header_bytes;
-  for (int item = 0; item < item_count; ++item) {
-    const std::size_t item_end =
-        items[item].payload_offset + items[item].bytes;
-    bytes = bytes > item_end ? bytes : item_end;
-  }
-  return bytes;
+__device__ int route_shard_block(
+    int source_node, int destination_node, int destination_local,
+    int node_count, int local_count, int shard, int route_shards,
+    int blocks) {
+  const std::uint64_t route =
+      (static_cast<std::uint64_t>(source_node) * node_count +
+       destination_node) *
+          local_count +
+      destination_local;
+  return static_cast<int>((route * route_shards + shard) % blocks);
 }
 
-__global__ void pack_and_deliver_local(
+__device__ void shard_slice(std::uint64_t count, int shard,
+                            int route_shards, std::uint64_t *offset,
+                            std::uint64_t *slice_count) {
+  const std::uint64_t vector_count = count / 4;
+  const std::uint64_t vector_begin =
+      vector_count * shard / route_shards;
+  const std::uint64_t vector_end =
+      vector_count * (shard + 1) / route_shards;
+  *offset = vector_begin * 4;
+  const std::uint64_t end =
+      shard + 1 == route_shards ? count : vector_end * 4;
+  *slice_count = end - *offset;
+}
+
+__device__ void scatter_assigned_shards(
+    ncclDevComm dev_comm, ncclWindow_t recv_window,
+    ncclWindow_t plan_window, ncclWindow_t inbox_window,
+    std::size_t slot_bytes, std::size_t node_bytes,
+    int route_shards) {
+  const ncclTeam lsa = ncclTeamLsa(dev_comm);
+  const ncclTeam rail = ncclTeamRail(dev_comm);
+  const int task_count = rail.nRanks * lsa.nRanks;
+  for (int task = 0; task < task_count; ++task) {
+    const int source_node = task / lsa.nRanks;
+    const int destination_local = task % lsa.nRanks;
+    if (source_node == rail.rank)
+      continue;
+    const int source = ncclTeamRankToWorld(dev_comm, rail, source_node);
+    const DevicePlanEntry *destination_plan =
+        static_cast<const DevicePlanEntry *>(ncclGetLsaPointer(
+            plan_window, 0, destination_local));
+    const DevicePlanEntry entry = destination_plan[source];
+    for (int shard = 0; shard < route_shards; ++shard) {
+      if (route_shard_block(
+              source_node, rail.rank, destination_local,
+              rail.nRanks, lsa.nRanks, shard, route_shards,
+              gridDim.x) != blockIdx.x)
+        continue;
+      std::uint64_t offset = 0;
+      std::uint64_t count = 0;
+      shard_slice(entry.recv_count, shard, route_shards, &offset, &count);
+      if (count == 0)
+        continue;
+      const value_type *source_values = static_cast<const value_type *>(
+          ncclGetLocalPointer(
+              inbox_window,
+              source_node * node_bytes + destination_local * slot_bytes +
+                  offset * sizeof(value_type)));
+      value_type *destination = static_cast<value_type *>(ncclGetLsaPointer(
+          recv_window,
+          (entry.recv_offset + offset) * sizeof(value_type),
+          destination_local));
+      copy_values(source_values, destination, count,
+                  threadIdx.x, blockDim.x);
+    }
+  }
+}
+
+__global__ void send_and_deliver_local(
     ncclDevComm dev_comm, ncclWindow_t send_window,
     ncclWindow_t recv_window, ncclWindow_t plan_window,
-    ncclWindow_t outbox_window, std::size_t packet_capacity) {
+    ncclWindow_t inbox_window, std::size_t slot_bytes,
+    std::size_t node_bytes, int route_shards) {
 #if __CUDA_ARCH__ >= 700
+  const int context_count =
+      min(static_cast<int>(gridDim.x),
+          static_cast<int>(dev_comm.ginContextCount));
+  const int context =
+      static_cast<int>(blockIdx.x) * context_count / gridDim.x;
+  ncclGin gin{dev_comm, context};
   ncclBarrierSession<ncclCoopCta> barrier{
-      ncclCoopCta(), ncclTeamTagLsa(), dev_comm, blockIdx.x};
+      ncclCoopCta(), ncclTeamTagWorld(), gin, blockIdx.x};
   barrier.sync(ncclCoopCta(), cuda::memory_order_acquire,
                ncclGinFenceLevel::None);
 
@@ -73,8 +133,6 @@ __global__ void pack_and_deliver_local(
   const int node_first_rank = dev_comm.rank - lsa.rank;
   const int thread = threadIdx.x + blockIdx.x * blockDim.x;
   const int threads = blockDim.x * gridDim.x;
-  const std::size_t header_bytes =
-      align_packet_bytes(lsa.nRanks * sizeof(HybridPacketItem));
   const DevicePlanEntry *plan = static_cast<const DevicePlanEntry *>(
       ncclGetLocalPointer(plan_window, 0));
 
@@ -91,130 +149,137 @@ __global__ void pack_and_deliver_local(
     copy_values(source, target, entry.send_count, thread, threads);
   }
 
-  for (int destination_node = 0; destination_node < rail.nRanks;
-       ++destination_node) {
-    if (destination_node == rail.rank)
-      continue;
-
-    char *packet = static_cast<char *>(ncclGetLocalPointer(
-        outbox_window, destination_node * packet_capacity));
-    HybridPacketItem *items = reinterpret_cast<HybridPacketItem *>(packet);
-    const int ingress_rank =
-        ncclTeamRankToWorld(dev_comm, rail, destination_node);
-    const int destination_first_rank = ingress_rank - lsa.rank;
-
-    std::size_t payload_offset = header_bytes;
-    for (int step = 0; step < lsa.nRanks; ++step) {
-      const int destination_local = (lsa.rank + step) % lsa.nRanks;
-      const int destination = destination_first_rank + destination_local;
+  if (threadIdx.x == 0) {
+    const int task_count = rail.nRanks * lsa.nRanks;
+    for (int task = 0; task < task_count; ++task) {
+      const int destination_node = task / lsa.nRanks;
+      const int destination_local = task % lsa.nRanks;
+      if (destination_node == rail.rank)
+        continue;
+      const int ingress_rank =
+          ncclTeamRankToWorld(dev_comm, rail, destination_node);
+      const int destination = ingress_rank - lsa.rank + destination_local;
       const DevicePlanEntry entry = plan[destination];
-      const std::size_t bytes = entry.send_count * sizeof(value_type);
-      if (thread == 0) {
-        items[destination_local] = HybridPacketItem{
-            bytes, entry.remote_recv_offset * sizeof(value_type),
-            payload_offset, 0};
+      for (int shard = 0; shard < route_shards; ++shard) {
+        if (route_shard_block(
+                rail.rank, destination_node, destination_local,
+                rail.nRanks, lsa.nRanks, shard, route_shards,
+                gridDim.x) != blockIdx.x)
+          continue;
+        std::uint64_t offset = 0;
+        std::uint64_t count = 0;
+        shard_slice(entry.send_count, shard, route_shards, &offset, &count);
+        if (count == 0)
+          continue;
+        const std::size_t inbox_offset =
+            rail.rank * node_bytes + destination_local * slot_bytes +
+            offset * sizeof(value_type);
+        gin.put(rail, destination_node, inbox_window, inbox_offset,
+                send_window,
+                (entry.send_offset + offset) * sizeof(value_type),
+                count * sizeof(value_type),
+                ncclGin_WeakSignalInc{
+                    static_cast<ncclGinSignal_t>(blockIdx.x)});
       }
-
-      const value_type *source = static_cast<const value_type *>(
-          ncclGetLocalPointer(send_window,
-                              entry.send_offset * sizeof(value_type)));
-      value_type *payload =
-          reinterpret_cast<value_type *>(packet + payload_offset);
-      copy_values(source, payload, entry.send_count, thread, threads);
-      payload_offset = align_packet_bytes(payload_offset + bytes);
     }
   }
+  __syncthreads();
+  gin.flush(ncclCoopCta());
 
   barrier.sync(ncclCoopCta(), cuda::memory_order_release,
                ncclGinFenceLevel::None);
 #endif
 }
 
-__global__ void exchange_rails_and_scatter(
+__global__ void wait_and_scatter(
     ncclDevComm dev_comm, ncclWindow_t recv_window,
-    ncclWindow_t outbox_window, ncclWindow_t inbox_window,
-    std::size_t packet_capacity, std::uint64_t epoch) {
+    ncclWindow_t plan_window, ncclWindow_t inbox_window,
+    std::size_t slot_bytes, std::size_t node_bytes,
+    int route_shards, std::uint64_t epoch) {
 #if __CUDA_ARCH__ >= 700
-  ncclGin gin{dev_comm, 0};
+  const int context_count =
+      min(static_cast<int>(gridDim.x),
+          static_cast<int>(dev_comm.ginContextCount));
+  const int context =
+      static_cast<int>(blockIdx.x) * context_count / gridDim.x;
+  ncclGin gin{dev_comm, context};
   ncclBarrierSession<ncclCoopCta> barrier{
       ncclCoopCta(), ncclTeamTagWorld(), gin, blockIdx.x};
-  barrier.sync(ncclCoopCta(), cuda::memory_order_acquire,
-               ncclGinFenceLevel::None);
-
   const ncclTeam lsa = ncclTeamLsa(dev_comm);
   const ncclTeam rail = ncclTeamRail(dev_comm);
-  const std::size_t header_bytes =
-      align_packet_bytes(lsa.nRanks * sizeof(HybridPacketItem));
 
-  if (blockIdx.x == 0) {
-    for (int destination_node = threadIdx.x;
-         destination_node < rail.nRanks;
-         destination_node += blockDim.x) {
-      if (destination_node == rail.rank)
+  const int task_count = rail.nRanks * lsa.nRanks;
+  __shared__ std::uint64_t expected;
+  if (threadIdx.x == 0) {
+    expected = 0;
+    for (int task = 0; task < task_count; ++task) {
+      const int source_node = task / lsa.nRanks;
+      const int destination_local = task % lsa.nRanks;
+      if (source_node == rail.rank)
         continue;
-      const std::size_t source_offset =
-          destination_node * packet_capacity;
-      const HybridPacketItem *items =
-          reinterpret_cast<const HybridPacketItem *>(
-              static_cast<const char *>(
-                  ncclGetLocalPointer(outbox_window, source_offset)));
-      gin.put(rail, destination_node, inbox_window,
-              rail.rank * packet_capacity, outbox_window, source_offset,
-              packet_bytes(items, lsa.nRanks, header_bytes),
-              ncclGin_WeakSignalInc{
-                  static_cast<unsigned int>(rail.rank)});
+      const int source = ncclTeamRankToWorld(dev_comm, rail, source_node);
+      const DevicePlanEntry *destination_plan =
+          static_cast<const DevicePlanEntry *>(ncclGetLsaPointer(
+              plan_window, 0, destination_local));
+      const DevicePlanEntry entry = destination_plan[source];
+      for (int shard = 0; shard < route_shards; ++shard) {
+        if (route_shard_block(
+                source_node, rail.rank, destination_local,
+                rail.nRanks, lsa.nRanks, shard, route_shards,
+                gridDim.x) != blockIdx.x)
+          continue;
+        std::uint64_t offset = 0;
+        std::uint64_t count = 0;
+        shard_slice(entry.recv_count, shard, route_shards, &offset, &count);
+        expected += count != 0;
+      }
     }
   }
-  if (blockIdx.x == 0) {
-    __syncthreads();
+  __syncthreads();
+  if (expected != 0) {
+    gin.waitSignal(
+        ncclCoopCta(), static_cast<ncclGinSignal_t>(blockIdx.x),
+        epoch * expected);
   }
+  scatter_assigned_shards(
+      dev_comm, recv_window, plan_window, inbox_window, slot_bytes,
+      node_bytes, route_shards);
 
-  for (int source_node = 0; source_node < rail.nRanks; ++source_node) {
-    if (source_node != rail.rank) {
-      gin.waitSignal(ncclCoopCta(), source_node, epoch);
-    }
-  }
-
-  if (blockIdx.x == 0)
-    gin.flush(ncclCoopCta());
-
-  const int thread = threadIdx.x + blockIdx.x * blockDim.x;
-  const int threads = blockDim.x * gridDim.x;
-  for (int source_node = 0; source_node < rail.nRanks; ++source_node) {
-    if (source_node == rail.rank)
-      continue;
-    const char *packet = static_cast<const char *>(ncclGetLocalPointer(
-        inbox_window, source_node * packet_capacity));
-    const HybridPacketItem *items =
-        reinterpret_cast<const HybridPacketItem *>(packet);
-    for (int step = 0; step < lsa.nRanks; ++step) {
-      const int destination_local = (lsa.rank + step) % lsa.nRanks;
-      const HybridPacketItem item = items[destination_local];
-      const value_type *payload =
-          reinterpret_cast<const value_type *>(packet + item.payload_offset);
-      value_type *destination = static_cast<value_type *>(ncclGetLsaPointer(
-          recv_window, item.recv_offset_bytes, destination_local));
-      copy_values(payload, destination, item.bytes / sizeof(value_type),
-                  thread, threads);
-    }
-  }
-
-  barrier.sync(ncclCoopCta(), cuda::memory_order_release,
+  barrier.sync(ncclCoopCta(), cuda::memory_order_acq_rel,
                ncclGinFenceLevel::None);
 #endif
 }
 
 void launch(const alltoallv::nccl_setup::State &state,
-            const alltoallv::Options &options, std::uint64_t epoch) {
-  pack_and_deliver_local<<<options.blocks, options.threads, 0, state.stream>>>(
-      state.dev_comm, state.send_window, state.recv_window, state.plan_window,
-      state.outbox_window, state.packet_capacity);
+            const alltoallv::Options &options, int route_shards,
+            std::uint64_t epoch) {
+  send_and_deliver_local<<<options.blocks, options.threads, 0,
+                           state.stream>>>(
+      state.dev_comm, state.send_window, state.recv_window,
+      state.plan_window, state.inbox_window, state.hybrid_slot_bytes,
+      state.hybrid_node_bytes, route_shards);
   ALLTOALLV_CUDA_CHECK(cudaGetLastError());
-  exchange_rails_and_scatter<<<options.blocks, options.threads, 0,
-                               state.stream>>>(
-      state.dev_comm, state.recv_window, state.outbox_window,
-      state.inbox_window, state.packet_capacity, epoch);
+  wait_and_scatter<<<options.blocks, options.threads, 0, state.stream>>>(
+      state.dev_comm, state.recv_window, state.plan_window,
+      state.inbox_window, state.hybrid_slot_bytes,
+      state.hybrid_node_bytes, route_shards, epoch);
   ALLTOALLV_CUDA_CHECK(cudaGetLastError());
+}
+
+int choose_route_shards(const alltoallv::nccl_setup::State &state,
+                        const alltoallv::Options &options,
+                        const alltoallv::Plan &plan) {
+  constexpr std::uint64_t kTargetBytes = 4ull << 20;
+  const int remote_routes =
+      (state.rail_team.nRanks - 1) * state.lsa_team.nRanks;
+  const int route_capacity =
+      std::max(1, options.blocks / remote_routes);
+  const std::uint64_t max_pair_bytes =
+      plan.max_pair_count * sizeof(value_type);
+  const std::uint64_t size_shards = std::max<std::uint64_t>(
+      1, (max_pair_bytes + kTargetBytes - 1) / kTargetBytes);
+  return static_cast<int>(std::min<std::uint64_t>(route_capacity,
+                                                  size_shards));
 }
 
 } // namespace
@@ -232,8 +297,13 @@ int main(int argc, char **argv) {
   }
 
   alltoallv::print_plan(plan, options, "NCCL LSA + railed GIN AlltoAllV");
+  const int route_shards = choose_route_shards(state, options, plan);
+  if (state.rank == 0) {
+    std::printf("NCCL hybrid routing: %d shard(s) per remote route\n",
+                route_shards);
+  }
   std::uint64_t epoch = 1;
-  launch(state, options, epoch);
+  launch(state, options, route_shards, epoch);
   ALLTOALLV_CUDA_CHECK(cudaStreamSynchronize(state.stream));
   int errors = alltoallv::nccl_setup::copy_and_validate(
       &state, plan, "NCCL LSA + railed GIN AlltoAllV");
@@ -243,7 +313,7 @@ int main(int argc, char **argv) {
   }
 
   for (int i = 0; i < options.warmup; ++i)
-    launch(state, options, ++epoch);
+    launch(state, options, route_shards, ++epoch);
   ALLTOALLV_CUDA_CHECK(cudaStreamSynchronize(state.stream));
   alltoallv::mpi_check(MPI_Barrier(MPI_COMM_WORLD),
                        "MPI_Barrier(benchmark)");
@@ -254,7 +324,7 @@ int main(int argc, char **argv) {
   ALLTOALLV_CUDA_CHECK(cudaEventCreate(&stop));
   ALLTOALLV_CUDA_CHECK(cudaEventRecord(start, state.stream));
   for (int i = 0; i < options.iterations; ++i)
-    launch(state, options, ++epoch);
+    launch(state, options, route_shards, ++epoch);
   ALLTOALLV_CUDA_CHECK(cudaEventRecord(stop, state.stream));
   ALLTOALLV_CUDA_CHECK(cudaEventSynchronize(stop));
   float elapsed_ms = 0.0f;
@@ -266,7 +336,7 @@ int main(int argc, char **argv) {
 
   ALLTOALLV_CUDA_CHECK(
       cudaMemsetAsync(state.recv, 0xa5, state.recv_bytes, state.stream));
-  launch(state, options, ++epoch);
+  launch(state, options, route_shards, ++epoch);
   ALLTOALLV_CUDA_CHECK(cudaStreamSynchronize(state.stream));
   errors = alltoallv::nccl_setup::copy_and_validate(
       &state, plan, "NCCL LSA + railed GIN AlltoAllV reuse");

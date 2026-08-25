@@ -100,7 +100,8 @@ allocation:
 
 ```bash
 make run_SOLVED NP=4 \
-  LAUNCHER="srun --nodes=1 --ntasks=4 --gpus-per-task=1"
+  LAUNCHER="srun --nodes=1 --ntasks=4 --gpus-per-task=1" \
+  RUN_ARGS="--blocks 128"
 ```
 
 Change the traffic pattern and payload with `RUN_ARGS`:

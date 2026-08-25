@@ -1,18 +1,14 @@
 # NCCL AlltoAllV with LSA and railed GIN
 
-This version is for multiple nodes with several GPUs per node. It assigns a
-different path to each part of the route:
+This version is for multiple nodes with several GPUs per node. It uses two
+different communication scopes:
 
-- LSA stores move data between GPUs in the same local LSA domain.
-- Railed GIN moves data between matching GPU positions on different nodes.
+- LSA pointers for GPUs in the same local LSA domain;
+- railed GIN between GPUs in the same local position on different nodes.
 
-Railed GIN is not a cheaper form of full GIN. A member of `ncclTeamRail`
-cannot address an arbitrary world rank. On a four-GPU node, GPU 2's rail team
-contains GPU 2 on every other node; it does not contain GPU 0, 1, or 3 on
-those nodes. Calling `gin.put` on that team with an arbitrary destination is
-invalid.
-
-The collective therefore takes two hops for a remote destination:
+Railed GIN cannot address an arbitrary world rank. On a four-GPU node, GPU 2's
+rail team contains GPU 2 on every other node, but not GPUs 0, 1, or 3 on those
+nodes. A remote message therefore needs an ingress GPU and one local scatter:
 
 ```text
 source node                         destination node
@@ -23,51 +19,101 @@ GPU 2 ==== rail 2 =================> GPU 2 -- LSA --> final local GPU
 GPU 3 ==== rail 3 =================> GPU 3 -- LSA --> final local GPU
 ```
 
-Every source GPU packs all of its messages for one destination node into one
-packet. It sends that packet to the GPU at the same local position on the
-destination node. The receiving GPU reads the packet header and scatters each
-submessage to its final local GPU through an LSA pointer. This keeps every
-rail active while reducing network operations from one per destination GPU to
-one per destination node.
+Each source GPU sends one variable-sized message for each remote destination
+GPU. The GIN put reads directly from the registered send window and writes a
+fixed slot in the matching ingress GPU's inbox. The ingress GPU then copies
+that slot through an LSA pointer to the final destination. There is no pack
+buffer or packet header in the data path.
 
-Local delivery and final scatter rotate their first LSA destination by the
-source GPU's LSA rank. That spreads each step across the local GPUs instead of
-making every source or ingress GPU write the same destination at once.
+## Inbox layout
 
-## Packet format
-
-The host allocates symmetric outbox and inbox windows. Each remote-node slot
-starts with one `HybridPacketItem` for each destination LSA rank:
+Every ingress GPU has the same symmetric inbox layout:
 
 ```text
-+----------------------+-------------------------------+
-| item 0 ... item L-1  | aligned payloads for L GPUs  |
-+----------------------+-------------------------------+
+                 destination LSA rank
+              0          1          2          3
+source node  +----------+----------+----------+----------+
+     0       | message  | message  | message  | message  |
+             +----------+----------+----------+----------+
+     1       | message  | message  | message  | message  |
+             +----------+----------+----------+----------+
 ```
 
-An item records the payload size, its offset in the packet, and its final
-offset in the destination GPU's receive window. The packet is compact: zero
-length messages occupy an item but no payload space.
+A slot is large enough for the largest source/destination pair in the current
+plan. The source-node coordinate is `rail.rank`; the destination coordinate is
+the LSA rank on the remote node. The source GPU's local position is implicit:
+rail GPU 2 sends only to rail GPU 2.
 
-## Ordering and completion
+Large messages are divided into shards inside that slot. Shard boundaries are
+16-byte aligned, and the last shard owns any scalar tail. The host aims for
+about 4 MiB per shard but never creates more shards than the CTA grid can
+spread across the remote routes:
 
-The implementation uses three handoffs.
+```text
+route_shards = min(
+    max(1, blocks / remote_routes),
+    max(1, ceil(largest_pair_bytes / 4 MiB)))
+```
 
-1. An LSA barrier brackets local stores and packet construction.
-2. Each remote `gin.put` carries a weak signal indexed by the source node.
-   That signal covers its own packet, which is exactly what the receiver needs
-   before reading the header and payload.
-3. After the signal waits, `gin.flush` makes the local outbox safe to reuse.
-   A closing hybrid barrier makes all LSA scatters visible and completes the
-   collective before the next iteration.
+Small messages therefore stay as one put per route. Larger messages can use
+several GIN contexts without changing the inbox allocation or adding headers.
 
-Signal values are cumulative. The host passes an `epoch` that increases on
-every launch, so a signal slot never needs to be reset while another rank may
-still update it.
+The ingress GPU needs the receive offset chosen by each final local GPU. It
+reads that GPU's registered plan through `ncclGetLsaPointer(plan_window, ...)`,
+then indexes the plan by the source world rank.
 
-The two kernels use these NCCL device APIs:
+## CTAs, contexts, and signals
+
+GIN signals belong to a GIN context. A sender and receiver must therefore use
+the same context for a shard. The helper `route_shard_block` maps
+
+```text
+(source node, destination node, destination LSA rank, shard)
+    -> CTA -> GIN context
+```
+
+the same way on both sides. The signal index is `blockIdx.x` within that
+matched context.
+
+The host requests one GIN context per CTA. The kernel uses
+`dev_comm.ginContextCount` because NCCL may create fewer contexts than were
+requested. The device communicator is created with matching resources:
 
 ```cpp
+requirements.ginContextCount = blocks;
+requirements.barrierCount = blocks;
+requirements.ginSignalCount = blocks;
+requirements.ginConnectionType = NCCL_GIN_CONNECTION_RAIL;
+
+ncclDevCommCreate(comm, &requirements, &dev_comm);
+```
+
+The launch is split into two kernels:
+
+1. `send_and_deliver_local` copies same-node messages with LSA pointers,
+   issues the remote shard puts, and flushes every issuing context.
+2. `wait_and_scatter` counts the non-empty incoming shards assigned to each
+   CTA, waits once for all of them, and copies them to the final local GPUs.
+
+Keeping the sends in a kernel with no remote waits avoids filling the GPU with
+waiting CTAs before all producer CTAs have run.
+
+Each non-empty shard attaches one weak signal increment to its put. The plan
+does not change during the program, so a CTA expects the same number of
+increments on every launch. At epoch `e`, it waits for
+`e * expected_nonempty_shards`. An empty shard neither signals nor contributes
+to that threshold.
+
+The weak signal makes its own inbox shard visible to the receiver.
+`gin.flush` is separate: it makes the sender's source range safe to reuse. The
+closing world barrier runs after every LSA scatter and completes the collective
+before the next launch can reuse an inbox slot.
+
+The main device APIs are:
+
+```cpp
+ncclGin(ncclDevComm const &comm, int context_index);
+
 void *ncclGetLocalPointer(ncclWindow_t window, size_t byte_offset);
 
 void *ncclGetLsaPointer(
@@ -75,12 +121,6 @@ void *ncclGetLsaPointer(
 
 int ncclTeamRankToWorld(
     ncclDevComm const &comm, ncclTeam team, int team_rank);
-
-ncclBarrierSession(
-    Coop coop, ncclTeamTagLsa, ncclDevComm const &comm, uint32_t index);
-
-ncclBarrierSession(
-    Coop coop, ncclTeamTagWorld, ncclGin gin, uint32_t index);
 
 void ncclGin::put(
     ncclTeam team, int peer,
@@ -92,82 +132,66 @@ void ncclGin::waitSignal(
     Coop coop, ncclGinSignal_t signal, uint64_t least);
 
 void ncclGin::flush(Coop coop);
+
+ncclBarrierSession(
+    Coop coop, ncclTeamTagWorld, ncclGin gin, uint32_t index);
 ```
 
-`ncclGetLocalPointer` names this rank's storage. `ncclGetLsaPointer` names the
-same offset on an LSA peer. `ncclTeamRankToWorld` converts a rail or LSA team
-rank before it is used to index the world-sized AlltoAllV plan. The weak
-signal belongs to one packet put: observing it makes that packet readable,
-while `flush` separately makes the sender's outbox safe to reuse.
+`ncclGetLocalPointer` names memory on the calling GPU.
+`ncclGetLsaPointer` names the same registered window on an LSA peer. The peer
+argument to `gin.put(rail, ...)` is a rail-team rank, while the AlltoAllV plan
+is indexed by world rank.
 
 ## Exercise
 
-Complete the two kernels in `nccl_lsa_gin_alltoallv.cu`.
+Open `nccl_lsa_gin_alltoallv.cu` and complete its three TODOs:
 
-In `pack_and_deliver_local`:
+1. copy each same-node message to its LSA target;
+2. put each non-empty remote shard directly into its fixed inbox slot and
+   attach a weak increment of this CTA's signal;
+3. wait for this CTA's cumulative signal threshold, then call the supplied
+   helper that scatters its assigned shards through LSA pointers.
 
-1. Use `ncclGetLsaPointer` to deliver messages whose destination is in the
-   local LSA team.
-2. Use `ncclTeamRankToWorld` to find the first world rank on each destination
-   node.
-3. Fill that node's packet header and copy the variable-sized payloads into
-   its outbox slot.
-
-In `exchange_rails_and_scatter`:
-
-1. Construct `ncclGin` on context 0 and a world
-   `ncclBarrierSession<ncclCoopCta>`.
-2. Send one packet to every remote member of `ncclTeamRail` with
-   `gin.put(..., ncclGin_WeakSignalInc{source_node})`.
-3. Wait for the current epoch from every remote source node and call
-   `gin.flush` on the issuing CTA.
-4. Read each inbox header and copy its payloads through LSA pointers to their
-   final receive offsets.
-
-The starter already contains the plan exchange, symmetric allocation and
-window registration, device-communicator requirements, launch loop,
-validation, and timing. The reference is
+The starter supplies the topology mapping, shard calculation, symmetric
+allocation, registered windows, GIN-context mapping, barriers, flushes,
+scatter traversal, launch loop, timing, and validation. The reference is
 `nccl_lsa_gin_alltoallv_SOLVED.cu`.
 
 ## Build and run
 
-This lab needs at least two nodes, a uniform LSA team size on every node, and
-railed GIN support in NCCL 2.31.2 or newer.
+This lab needs NCCL 2.31.2 or newer, at least two nodes, uniform LSA team sizes,
+contiguous world ranks within each node, and railed GIN support. The setup
+checks that layout before launching the kernel.
 
 ```bash
-make
-make run_SOLVED NP=4 \
-  LAUNCHER='srun --nodes=2 --ntasks=4 --ntasks-per-node=2 --gpus-per-task=1'
+make NCCL_HOME=/path/to/nccl CUDA_HOME=/path/to/cuda CUDA_ARCH=90
+
+make run_SOLVED NP=8 \
+  LAUNCHER='srun --nodes=2 --ntasks=8 --ntasks-per-node=4 --gpus-per-task=1'
 ```
 
-The run target defaults to `NCCL_IB_MERGE_NICS=0` and `NCCL_CROSS_NIC=0`.
-That asks NCCL for corresponding GPU/NIC rails rather than arbitrary
-cross-NIC connections. The variables can be overridden on the Make command
-line if a system has a different validated mapping. The Makefile also puts
-`NCCL_HOME/lib` first in `LD_LIBRARY_PATH` so the device headers and runtime
-library come from the same installation.
+The run target defaults to `NCCL_IB_MERGE_NICS=0` and `NCCL_CROSS_NIC=0` so
+NCCL builds corresponding GPU/NIC rails. Override those variables only when a
+system has a different validated mapping.
 
-The four-rank command is the smallest mixed placement. To exercise every GPU
-and rail on two four-GPU nodes, use 8 tasks with 4 tasks per node.
-
-Pass the same workload controls used by the other AlltoAllV labs through
-`RUN_ARGS`:
+Use the same workload controls as the other labs:
 
 ```bash
-make run_SOLVED NP=4 \
-  LAUNCHER='srun --nodes=2 --ntasks=4 --ntasks-per-node=2 --gpus-per-task=1' \
-  RUN_ARGS='--pattern sparse --bytes-per-rank 16M --iters 50'
+make run_SOLVED NP=8 \
+  LAUNCHER='srun --nodes=2 --ntasks=8 --ntasks-per-node=4 --gpus-per-task=1' \
+  RUN_ARGS='--pattern sparse --bytes-per-rank 64M --blocks 16 --iters 50'
 ```
 
-The program prints the discovered world, LSA, and rail sizes. It prints
-`SKIP` instead of guessing when the placement does not form uniform LSA and
-rail teams or when railed GIN is unavailable. A successful run reports both
-correctness and the slowest-rank iteration time. For a mixed run, use the
-separate inter-host placement rate when comparing with the IB rails. This lab
-also verifies that each LSA team matches one host before it runs. The combined
-logical rate includes local LSA traffic, while each remote byte incurs a pack
-copy and a scatter copy in addition to the network transfer.
+CTA count affects both the LSA copy and the requested GIN-context count. Start
+with the default for small messages and measure `--blocks 16` and `--blocks
+64` for larger messages.
 
-This implementation uses ordinary Hopper-compatible loads, stores, and GIN
-operations. It does not require NVLS, multimem instructions, or a
-Blackwell-only device feature.
+The program prints `SKIP` if the placement does not form uniform LSA and rail
+teams or if railed GIN is unavailable. For performance comparisons, use the
+inter-host placement rate for the network part. Each remote byte is read by
+GIN, written to the inbox, read for the scatter, and written to the final
+receive buffer.
+
+This implementation uses Hopper-compatible loads, stores, LSA pointers, and
+GIN operations. It does not require NVLS, multimem instructions, or a
+Blackwell-only feature.

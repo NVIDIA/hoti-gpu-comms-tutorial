@@ -42,13 +42,6 @@ namespace alltoallv::nccl_setup {
 enum class Backend { Lsa, Gin, HybridRail };
 enum class SetupResult { Ready, Skipped };
 
-struct alignas(16) HybridPacketItem {
-  std::uint64_t bytes;
-  std::uint64_t recv_offset_bytes;
-  std::uint64_t payload_offset;
-  std::uint64_t reserved;
-};
-
 struct State {
   int rank = -1;
   int size = 0;
@@ -63,18 +56,17 @@ struct State {
   void *send = nullptr;
   void *recv = nullptr;
   void *plan = nullptr;
-  void *outbox = nullptr;
   void *inbox = nullptr;
   ncclWindow_t send_window = nullptr;
   ncclWindow_t recv_window = nullptr;
   ncclWindow_t plan_window = nullptr;
-  ncclWindow_t outbox_window = nullptr;
   ncclWindow_t inbox_window = nullptr;
 
   std::size_t send_bytes = 0;
   std::size_t recv_bytes = 0;
   std::size_t plan_bytes = 0;
-  std::size_t packet_capacity = 0;
+  std::size_t hybrid_slot_bytes = 0;
+  std::size_t hybrid_node_bytes = 0;
   std::size_t staging_bytes = 0;
 };
 
@@ -101,7 +93,6 @@ inline void finish(State *state) {
     }
   };
   deregister(&state->inbox_window);
-  deregister(&state->outbox_window);
   deregister(&state->plan_window);
   deregister(&state->recv_window);
   deregister(&state->send_window);
@@ -113,7 +104,6 @@ inline void finish(State *state) {
     }
   };
   release(&state->inbox);
-  release(&state->outbox);
   release(&state->plan);
   release(&state->recv);
   release(&state->send);
@@ -229,12 +219,46 @@ inline SetupResult prepare(State *state, int *argc, char ***argv,
   if (backend == Backend::Gin)
     capable = capable && properties.ginType != NCCL_GIN_TYPE_NONE;
   if (backend == Backend::HybridRail) {
+    int aligned_layout = 1;
+    const int local_first = state->rank - state->lsa_team.rank;
+    for (int local_rank = 0; local_rank < state->lsa_team.nRanks;
+         ++local_rank) {
+      const int world_rank =
+          ncclTeamRankToWorld(state->comm, state->lsa_team, local_rank);
+      aligned_layout = aligned_layout &&
+                       world_rank == local_first + local_rank;
+    }
+    for (int node = 0; node < state->rail_team.nRanks; ++node) {
+      const int ingress =
+          ncclTeamRankToWorld(state->comm, state->rail_team, node);
+      if (ingress < 0 || ingress >= state->size) {
+        aligned_layout = 0;
+        continue;
+      }
+      aligned_layout =
+          aligned_layout &&
+          plan->local_ranks[ingress] == state->lsa_team.rank;
+      const int node_first = ingress - state->lsa_team.rank;
+      for (int local_rank = 0; local_rank < state->lsa_team.nRanks;
+           ++local_rank) {
+        const int world_rank = node_first + local_rank;
+        aligned_layout =
+            aligned_layout && world_rank >= 0 && world_rank < state->size;
+        if (world_rank < 0 || world_rank >= state->size)
+          continue;
+        aligned_layout =
+            aligned_layout &&
+            plan->node_roots[world_rank] == plan->node_roots[ingress] &&
+            plan->local_ranks[world_rank] == local_rank;
+      }
+    }
     capable = capable && properties.railedGinType != NCCL_GIN_TYPE_NONE &&
               state->lsa_team.nRanks > 1 && state->rail_team.nRanks > 1 &&
               state->lsa_team.nRanks * state->rail_team.nRanks == state->size &&
               min_lsa_size == max_lsa_size &&
               min_rail_size == max_rail_size &&
-              state->lsa_team.rank == plan->local_ranks[state->rank];
+              state->lsa_team.rank == plan->local_ranks[state->rank] &&
+              aligned_layout;
   }
   int all_capable = 0;
   alltoallv::mpi_check(MPI_Allreduce(&capable, &all_capable, 1, MPI_INT,
@@ -247,7 +271,7 @@ inline SetupResult prepare(State *state, int *argc, char ***argv,
       print_skip(*state, "full GIN connectivity is unavailable");
     else
       print_skip(*state,
-                 "this placement does not provide aligned, uniform LSA "
+                 "this placement does not provide aligned, contiguous LSA "
                  "teams and railed GIN across at least two nodes");
     return SetupResult::Skipped;
   }
@@ -259,23 +283,19 @@ inline SetupResult prepare(State *state, int *argc, char ***argv,
   state->plan_bytes = std::max<std::size_t>(
       1, plan->size * sizeof(DevicePlanEntry));
   if (backend == Backend::HybridRail) {
-    std::size_t header = align_bytes(state->lsa_team.nRanks *
-                                     sizeof(HybridPacketItem));
-    std::size_t max_message =
+    state->hybrid_slot_bytes =
         align_bytes(plan->max_pair_count * sizeof(value_type));
-    state->packet_capacity =
-        header + state->lsa_team.nRanks * max_message;
+    state->hybrid_node_bytes =
+        state->lsa_team.nRanks * state->hybrid_slot_bytes;
     state->staging_bytes =
         std::max<std::size_t>(1, state->rail_team.nRanks *
-                                    state->packet_capacity);
+                                    state->hybrid_node_bytes);
   }
 
   ALLTOALLV_NCCL_CHECK(ncclMemAlloc(&state->send, state->send_bytes));
   ALLTOALLV_NCCL_CHECK(ncclMemAlloc(&state->recv, state->recv_bytes));
   ALLTOALLV_NCCL_CHECK(ncclMemAlloc(&state->plan, state->plan_bytes));
   if (backend == Backend::HybridRail) {
-    ALLTOALLV_NCCL_CHECK(
-        ncclMemAlloc(&state->outbox, state->staging_bytes));
     ALLTOALLV_NCCL_CHECK(
         ncclMemAlloc(&state->inbox, state->staging_bytes));
   }
@@ -291,8 +311,6 @@ inline SetupResult prepare(State *state, int *argc, char ***argv,
       state->plan, entries.data(), state->plan_bytes, cudaMemcpyHostToDevice,
       state->stream));
   if (backend == Backend::HybridRail) {
-    ALLTOALLV_CUDA_CHECK(cudaMemsetAsync(state->outbox, 0,
-                                        state->staging_bytes, state->stream));
     ALLTOALLV_CUDA_CHECK(cudaMemsetAsync(state->inbox, 0,
                                         state->staging_bytes, state->stream));
   }
@@ -308,9 +326,6 @@ inline SetupResult prepare(State *state, int *argc, char ***argv,
       state->comm, state->plan, state->plan_bytes, &state->plan_window,
       NCCL_WIN_COLL_SYMMETRIC));
   if (backend == Backend::HybridRail) {
-    ALLTOALLV_NCCL_CHECK(ncclCommWindowRegister(
-        state->comm, state->outbox, state->staging_bytes,
-        &state->outbox_window, NCCL_WIN_COLL_SYMMETRIC));
     ALLTOALLV_NCCL_CHECK(ncclCommWindowRegister(
         state->comm, state->inbox, state->staging_bytes,
         &state->inbox_window, NCCL_WIN_COLL_SYMMETRIC));
@@ -328,9 +343,9 @@ inline SetupResult prepare(State *state, int *argc, char ***argv,
     requirements.ginStrongSignalsRequired = false;
     requirements.ginVaSignalsRequired = false;
   } else {
-    requirements.ginContextCount = 1;
+    requirements.ginContextCount = options->blocks;
     requirements.barrierCount = options->blocks;
-    requirements.ginSignalCount = state->rail_team.nRanks;
+    requirements.ginSignalCount = options->blocks;
     requirements.ginConnectionType = NCCL_GIN_CONNECTION_RAIL;
     requirements.ginStrongSignalsRequired = false;
     requirements.ginVaSignalsRequired = false;
