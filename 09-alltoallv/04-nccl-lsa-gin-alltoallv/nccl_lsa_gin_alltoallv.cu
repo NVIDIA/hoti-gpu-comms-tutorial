@@ -42,13 +42,13 @@ __device__ void copy_values(const value_type *source, value_type *destination,
 }
 
 __device__ int route_shard_block(
-    int source_node, int destination_node, int destination_local,
-    int node_count, int local_count, int shard, int route_shards,
+    int source_domain, int destination_domain, int destination_local,
+    int domain_count, int local_count, int shard, int route_shards,
     int blocks) {
-  const int node_delta =
-      (destination_node - source_node + node_count) % node_count;
+  const int domain_delta =
+      (destination_domain - source_domain + domain_count) % domain_count;
   const std::uint64_t route =
-      static_cast<std::uint64_t>(node_delta - 1) * local_count +
+      static_cast<std::uint64_t>(domain_delta - 1) * local_count +
       destination_local;
   return static_cast<int>((route * route_shards + shard) % blocks);
 }
@@ -70,24 +70,24 @@ __device__ void shard_slice(std::uint64_t count, int shard,
 __device__ void scatter_assigned_shards(
     ncclDevComm dev_comm, ncclWindow_t recv_window,
     ncclWindow_t plan_window, ncclWindow_t inbox_window,
-    std::size_t slot_bytes, std::size_t node_bytes,
+    std::size_t slot_bytes, std::size_t domain_bytes,
     int route_shards) {
   const ncclTeam lsa = ncclTeamLsa(dev_comm);
   const ncclTeam rail = ncclTeamRail(dev_comm);
   const int task_count = rail.nRanks * lsa.nRanks;
   for (int task = 0; task < task_count; ++task) {
-    const int source_node = task / lsa.nRanks;
+    const int source_domain = task / lsa.nRanks;
     const int destination_local = task % lsa.nRanks;
-    if (source_node == rail.rank)
+    if (source_domain == rail.rank)
       continue;
-    const int source = ncclTeamRankToWorld(dev_comm, rail, source_node);
+    const int source = ncclTeamRankToWorld(dev_comm, rail, source_domain);
     const DevicePlanEntry *destination_plan =
         static_cast<const DevicePlanEntry *>(ncclGetLsaPointer(
             plan_window, 0, destination_local));
     const DevicePlanEntry entry = destination_plan[source];
     for (int shard = 0; shard < route_shards; ++shard) {
       if (route_shard_block(
-              source_node, rail.rank, destination_local,
+              source_domain, rail.rank, destination_local,
               rail.nRanks, lsa.nRanks, shard, route_shards,
               gridDim.x) != blockIdx.x)
         continue;
@@ -99,7 +99,7 @@ __device__ void scatter_assigned_shards(
       const value_type *source_values = static_cast<const value_type *>(
           ncclGetLocalPointer(
               inbox_window,
-              source_node * node_bytes + destination_local * slot_bytes +
+              source_domain * domain_bytes + destination_local * slot_bytes +
                   offset * sizeof(value_type)));
       value_type *destination = static_cast<value_type *>(ncclGetLsaPointer(
           recv_window,
@@ -115,13 +115,12 @@ __global__ void send_and_deliver_local(
     ncclDevComm dev_comm, ncclWindow_t send_window,
     ncclWindow_t recv_window, ncclWindow_t plan_window,
     ncclWindow_t inbox_window, std::size_t slot_bytes,
-    std::size_t node_bytes, int route_shards) {
+    std::size_t domain_bytes, int route_shards) {
 #if __CUDA_ARCH__ >= 700
   const int context_count =
       min(static_cast<int>(gridDim.x),
           static_cast<int>(dev_comm.ginContextCount));
-  const int context =
-      static_cast<int>(blockIdx.x) * context_count / gridDim.x;
+  const int context = static_cast<int>(blockIdx.x) % context_count;
   const ncclGinSignal_t signal =
       static_cast<ncclGinSignal_t>(blockIdx.x);
   ncclGin gin{dev_comm, context};
@@ -132,44 +131,45 @@ __global__ void send_and_deliver_local(
 
   const ncclTeam lsa = ncclTeamLsa(dev_comm);
   const ncclTeam rail = ncclTeamRail(dev_comm);
-  const int node_first_rank = dev_comm.rank - lsa.rank;
-  const int thread = threadIdx.x + blockIdx.x * blockDim.x;
-  const int threads = blockDim.x * gridDim.x;
+  const int domain_first_rank = dev_comm.rank - lsa.rank;
   const DevicePlanEntry *plan = static_cast<const DevicePlanEntry *>(
       ncclGetLocalPointer(plan_window, 0));
 
   for (int step = 0; step < lsa.nRanks; ++step) {
-    const int destination_local = (lsa.rank + step) % lsa.nRanks;
-    const int destination = node_first_rank + destination_local;
+    const int destination_local =
+        (lsa.rank + step + blockIdx.x) % lsa.nRanks;
+    const int destination = domain_first_rank + destination_local;
     const DevicePlanEntry entry = plan[destination];
+    std::uint64_t offset = 0;
+    std::uint64_t count = 0;
+    shard_slice(entry.send_count, blockIdx.x, gridDim.x, &offset, &count);
     const value_type *source = static_cast<const value_type *>(
         ncclGetLocalPointer(send_window,
-                            entry.send_offset * sizeof(value_type)));
+                            (entry.send_offset + offset) * sizeof(value_type)));
     value_type *target = static_cast<value_type *>(ncclGetLsaPointer(
-        recv_window, entry.remote_recv_offset * sizeof(value_type),
+        recv_window, (entry.remote_recv_offset + offset) * sizeof(value_type),
         destination_local));
 
-    // TODO: Copy the local message from source to target.
+    // TODO: Copy this CTA's local shard from source to target.
     (void)source;
     (void)target;
-    (void)thread;
-    (void)threads;
+    (void)count;
   }
 
   if (threadIdx.x == 0) {
     const int task_count = rail.nRanks * lsa.nRanks;
     for (int task = 0; task < task_count; ++task) {
-      const int destination_node = task / lsa.nRanks;
+      const int destination_domain = task / lsa.nRanks;
       const int destination_local = task % lsa.nRanks;
-      if (destination_node == rail.rank)
+      if (destination_domain == rail.rank)
         continue;
       const int ingress_rank =
-          ncclTeamRankToWorld(dev_comm, rail, destination_node);
+          ncclTeamRankToWorld(dev_comm, rail, destination_domain);
       const int destination = ingress_rank - lsa.rank + destination_local;
       const DevicePlanEntry entry = plan[destination];
       for (int shard = 0; shard < route_shards; ++shard) {
         if (route_shard_block(
-                rail.rank, destination_node, destination_local,
+                rail.rank, destination_domain, destination_local,
                 rail.nRanks, lsa.nRanks, shard, route_shards,
                 gridDim.x) != blockIdx.x)
           continue;
@@ -179,10 +179,10 @@ __global__ void send_and_deliver_local(
         if (count == 0)
           continue;
         const std::size_t inbox_offset =
-            rail.rank * node_bytes + destination_local * slot_bytes +
+            rail.rank * domain_bytes + destination_local * slot_bytes +
             offset * sizeof(value_type);
 
-        // TODO: Put this shard into inbox_offset on destination_node. Attach
+        // TODO: Put this shard into inbox_offset on destination_domain. Attach
         // ncclGin_WeakSignalInc for this CTA's signal index.
         (void)inbox_offset;
       }
@@ -195,14 +195,13 @@ __global__ void send_and_deliver_local(
 __global__ void wait_and_scatter(
     ncclDevComm dev_comm, ncclWindow_t recv_window,
     ncclWindow_t plan_window, ncclWindow_t inbox_window,
-    std::size_t slot_bytes, std::size_t node_bytes,
+    std::size_t slot_bytes, std::size_t domain_bytes,
     int route_shards, std::uint64_t epoch) {
 #if __CUDA_ARCH__ >= 700
   const int context_count =
       min(static_cast<int>(gridDim.x),
           static_cast<int>(dev_comm.ginContextCount));
-  const int context =
-      static_cast<int>(blockIdx.x) * context_count / gridDim.x;
+  const int context = static_cast<int>(blockIdx.x) % context_count;
   const ncclGinSignal_t signal =
       static_cast<ncclGinSignal_t>(blockIdx.x);
   ncclGin gin{dev_comm, context};
@@ -216,18 +215,18 @@ __global__ void wait_and_scatter(
   if (threadIdx.x == 0) {
     expected = 0;
     for (int task = 0; task < task_count; ++task) {
-      const int source_node = task / lsa.nRanks;
+      const int source_domain = task / lsa.nRanks;
       const int destination_local = task % lsa.nRanks;
-      if (source_node == rail.rank)
+      if (source_domain == rail.rank)
         continue;
-      const int source = ncclTeamRankToWorld(dev_comm, rail, source_node);
+      const int source = ncclTeamRankToWorld(dev_comm, rail, source_domain);
       const DevicePlanEntry *destination_plan =
           static_cast<const DevicePlanEntry *>(ncclGetLsaPointer(
               plan_window, 0, destination_local));
       const DevicePlanEntry entry = destination_plan[source];
       for (int shard = 0; shard < route_shards; ++shard) {
         if (route_shard_block(
-                source_node, rail.rank, destination_local,
+                source_domain, rail.rank, destination_local,
                 rail.nRanks, lsa.nRanks, shard, route_shards,
                 gridDim.x) != blockIdx.x)
           continue;
@@ -258,12 +257,12 @@ void launch(const alltoallv::nccl_setup::State &state,
                            state.stream>>>(
       state.dev_comm, state.send_window, state.recv_window,
       state.plan_window, state.inbox_window, state.hybrid_slot_bytes,
-      state.hybrid_node_bytes, route_shards);
+      state.hybrid_domain_bytes, route_shards);
   ALLTOALLV_CUDA_CHECK(cudaGetLastError());
   wait_and_scatter<<<options.blocks, options.threads, 0, state.stream>>>(
       state.dev_comm, state.recv_window, state.plan_window,
       state.inbox_window, state.hybrid_slot_bytes,
-      state.hybrid_node_bytes, route_shards, epoch);
+      state.hybrid_domain_bytes, route_shards, epoch);
   ALLTOALLV_CUDA_CHECK(cudaGetLastError());
 }
 
@@ -275,7 +274,7 @@ int choose_route_shards(const alltoallv::nccl_setup::State &state,
       (state.rail_team.nRanks - 1) * state.lsa_team.nRanks;
   std::uint64_t local_max_pair = 0;
   for (int peer = 0; peer < plan.size; ++peer) {
-    if (plan.node_roots[peer] != plan.node_roots[plan.rank])
+    if (plan.domain_roots[peer] != plan.domain_roots[plan.rank])
       local_max_pair = std::max(local_max_pair, plan.send_counts[peer]);
   }
   std::uint64_t max_pair_count = 0;

@@ -3,8 +3,8 @@
 GIN lets a GPU kernel initiate network operations directly. This exercise uses
 full GIN connectivity: every rank can name every other world rank as the peer
 of a `gin.put`. It is the network baseline for AlltoAllV and is easiest to
-measure with one GPU on each of two or more nodes, so every non-self transfer
-crosses InfiniBand.
+measure with one GPU in each NVLink domain, so every non-self transfer crosses
+InfiniBand.
 
 The send and receive layout is the same as in the LSA exercise. A sender uses
 `DevicePlanEntry::send_offset` for its local source and
@@ -13,29 +13,32 @@ registered receive window.
 
 ## CTA sharding and signals
 
-One large transfer per rank pair would leave most CTAs idle. Instead, CTA `b`
-owns shard `b` of every source-to-destination segment:
+One large transfer per rank pair would leave most GIN contexts idle. Each CTA
+therefore owns one shard of one route:
 
 ```text
-source r -> destination p
-
-send segment:  [ CTA 0 ][ CTA 1 ][ CTA 2 ] ... [ CTA B-1 ]
-                    |       |       |                 |
-signal index:       0       1       2                B-1
+CTA:             0       1       2       3       4       5   ...
+peer, round:   +1,0    +2,0    +3,0    +2,1    +3,1    +1,1  ...
+GIN context:     0       1       2       3       4       5   ...
 ```
 
-Each non-empty shard becomes one GIN put. The host requests one GIN context per
-CTA, and the kernel distributes the CTAs over however many contexts NCCL was
-able to create. Each CTA has its own signal index, `blockIdx.x`. On a receiver,
-the incoming counts tell CTA `b` exactly how many sources have a non-empty
-shard `b`, so it knows the signal value to wait for even for the `sparse`
-pattern.
+The example above has four ranks, so there are three non-self routes. The first
+round assigns one route to each CTA. The next round shifts the route assignment
+by one slot. The shifts spread each route over different GIN contexts instead
+of pinning one peer to one QP. When a communicator has multiple GIN
+connections, NCCL also stripes those context IDs over the connections. Each
+non-empty non-self shard is one GIN put. All CTA threads copy a shard of the
+self segment directly between the local send and receive buffers; self traffic
+does not consume a GIN route.
 
-Source rank `r` visits peers in the order `r, r+1, ...` with wraparound. This
-keeps all sources from targeting peer 0 at the same time. CTA count still
-controls transfer size, operation count, and the requested GIN parallelism,
-so it is a parameter to measure rather than an occupancy knob that should
-always be increased.
+The host requests one GIN context per CTA. NCCL may create a different number,
+for example by rounding the request up across GIN connections. The kernel
+assigns CTAs to the created contexts round-robin. Each CTA uses `blockIdx.x` as
+its signal index. Its route identifies the one source from which it may receive
+a shard, so the incoming count tells it whether to wait for zero or one signal.
+`--blocks` must be at least the number of non-self routes, or `ranks - 1`.
+More blocks create more route shards and request more GIN contexts; they are
+not simply an occupancy knob.
 
 The synchronization sequence in each CTA is:
 
@@ -86,9 +89,9 @@ void ncclGinBarrierSession::sync(
 ```
 
 The put offsets and size are bytes. `ncclDevComm::ginContextCount` is the
-number of contexts NCCL actually made, which can be smaller than the host
-request. Only thread 0 in each CTA issues puts; `waitSignal` and `flush` are
-called cooperatively by the full CTA.
+number of contexts NCCL actually made; it can differ from the host request in
+either direction. Only thread 0 in each CTA issues puts; `waitSignal` and
+`flush` are called cooperatively by the full CTA.
 
 ## Exercise
 
@@ -96,14 +99,15 @@ Open `nccl_gin_alltoallv.cu` and complete the TODOs in
 `nccl_gin_alltoallv_kernel`:
 
 1. synchronize the world GIN barrier after reading the signal baseline;
-2. issue each non-empty shard with `gin.put` and
+2. issue each non-empty non-self shard with `gin.put` and
    `ncclGin_WeakSignalInc`;
 3. wait for the calculated number of incoming shard signals;
 4. flush the CTA's outgoing operations and close the world barrier.
 
-The starter already supplies the shard calculation, expected-arrival count,
-host setup, registered windows, timing loop, and validation. The completed
-reference is `nccl_gin_alltoallv_SOLVED.cu`.
+The starter already supplies the route assignment, local self copy, shard
+calculation, expected-arrival count, host setup, registered windows, timing
+loop, and validation. The completed reference is
+`nccl_gin_alltoallv_SOLVED.cu`.
 
 ## Build
 
@@ -120,13 +124,20 @@ targets. You can confirm the selected runtime before launching with
 
 ## Run over InfiniBand
 
-The clearest GIN-only placement uses one GPU per node:
+The clearest GIN-only placement uses one GPU per NVLink domain. On Lyris,
+`--segment=1 --spread-segments` places each selected compute tray in a
+different NVL72 base block:
 
 ```bash
-make run_SOLVED NP=2 \
-  LAUNCHER="srun --nodes=2 --ntasks-per-node=1 --gpus-per-task=1" \
-  RUN_ARGS="--pattern offdiagonal"
+make run_SOLVED NP=4 \
+  LAUNCHER="srun --mpi=pmix_v5 --nodes=4 --ntasks=4 --ntasks-per-node=1 --segment=1 --spread-segments --cpu-bind=none" \
+  RUN_ARGS="--pattern offdiagonal --bytes-per-rank 256M --blocks 48 --threads 256 --warmup 20 --iters 100"
 ```
+
+A 48-CTA launch was the best large-message starting point in the four-rank
+Lyris sweep used for this lab. It is a measured tuning point, not a portable
+default: sweep `--blocks` again when the rank count, message distribution, or
+GPU and NIC topology changes.
 
 The run target defaults to `NCCL_IB_MERGE_NICS=0` and `NCCL_CROSS_NIC=1`.
 Full GIN needs arbitrary peer connectivity and is unavailable when
@@ -139,7 +150,7 @@ For a larger or sparse run:
 
 ```bash
 make run_SOLVED NP=4 \
-  LAUNCHER="srun --nodes=4 --ntasks-per-node=1 --gpus-per-task=1" \
+  LAUNCHER="srun --mpi=pmix_v5 --nodes=4 --ntasks=4 --ntasks-per-node=1 --segment=1 --spread-segments --cpu-bind=none" \
   RUN_ARGS="--pattern sparse --bytes-per-rank 16M --warmup 10 --iters 50"
 ```
 
@@ -148,10 +159,10 @@ full GIN connectivity is unavailable for the selected placement or transport,
 it prints `SKIP`. A successful run ends with output like:
 
 ```text
-NCCL topology: world=2, LSA=1, rail=2
+NCCL topology: world=4, LSA=1, rail=4
 NCCL GIN AlltoAllV correctness: PASS
 NCCL GIN AlltoAllV performance: ... ms/iteration, ... GB/s logical non-self
-NCCL GIN AlltoAllV placement payload rates: 0.000 GB/s same-host non-self, ... GB/s inter-host
+NCCL GIN AlltoAllV placement payload rates (NCCL LSA): 0.000 GB/s same-domain non-self, ... GB/s cross-domain
 ```
 
 The reported bandwidth counts payload sent to other ranks and uses the

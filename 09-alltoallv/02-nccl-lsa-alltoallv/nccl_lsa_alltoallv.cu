@@ -65,7 +65,8 @@ __global__ void nccl_lsa_alltoallv_kernel(ncclDevComm dev_comm,
     (void)entry;
   }
 
-  // TODO: Leave the LSA barrier with release ordering after peer stores finish.
+  // TODO: Leave the LSA barrier with acquire-release ordering after peer stores
+  // finish.
   (void)send_window;
   (void)recv_window;
   (void)barrier;

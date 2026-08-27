@@ -66,7 +66,7 @@ struct State {
   std::size_t recv_bytes = 0;
   std::size_t plan_bytes = 0;
   std::size_t hybrid_slot_bytes = 0;
-  std::size_t hybrid_node_bytes = 0;
+  std::size_t hybrid_domain_bytes = 0;
   std::size_t staging_bytes = 0;
 };
 
@@ -195,6 +195,10 @@ inline SetupResult prepare(State *state, int *argc, char ***argv,
       ncclCommQueryProperties(state->comm, &properties));
   state->lsa_team = ncclTeamLsa(state->comm);
   state->rail_team = ncclTeamRail(state->comm);
+  const int lsa_root =
+      ncclTeamRankToWorld(state->comm, state->lsa_team, 0);
+  alltoallv::classify_placement(plan, lsa_root, state->lsa_team.rank,
+                                "NCCL LSA");
 
   int min_lsa_size = 0;
   int max_lsa_size = 0;
@@ -228,28 +232,28 @@ inline SetupResult prepare(State *state, int *argc, char ***argv,
       aligned_layout = aligned_layout &&
                        world_rank == local_first + local_rank;
     }
-    for (int node = 0; node < state->rail_team.nRanks; ++node) {
+    for (int domain = 0; domain < state->rail_team.nRanks; ++domain) {
       const int ingress =
-          ncclTeamRankToWorld(state->comm, state->rail_team, node);
+          ncclTeamRankToWorld(state->comm, state->rail_team, domain);
       if (ingress < 0 || ingress >= state->size) {
         aligned_layout = 0;
         continue;
       }
       aligned_layout =
           aligned_layout &&
-          plan->local_ranks[ingress] == state->lsa_team.rank;
-      const int node_first = ingress - state->lsa_team.rank;
+          plan->domain_ranks[ingress] == state->lsa_team.rank;
+      const int domain_first = ingress - state->lsa_team.rank;
       for (int local_rank = 0; local_rank < state->lsa_team.nRanks;
            ++local_rank) {
-        const int world_rank = node_first + local_rank;
+        const int world_rank = domain_first + local_rank;
         aligned_layout =
             aligned_layout && world_rank >= 0 && world_rank < state->size;
         if (world_rank < 0 || world_rank >= state->size)
           continue;
         aligned_layout =
             aligned_layout &&
-            plan->node_roots[world_rank] == plan->node_roots[ingress] &&
-            plan->local_ranks[world_rank] == local_rank;
+            plan->domain_roots[world_rank] == plan->domain_roots[ingress] &&
+            plan->domain_ranks[world_rank] == local_rank;
       }
     }
     capable = capable && properties.railedGinType != NCCL_GIN_TYPE_NONE &&
@@ -257,7 +261,7 @@ inline SetupResult prepare(State *state, int *argc, char ***argv,
               state->lsa_team.nRanks * state->rail_team.nRanks == state->size &&
               min_lsa_size == max_lsa_size &&
               min_rail_size == max_rail_size &&
-              state->lsa_team.rank == plan->local_ranks[state->rank] &&
+              state->lsa_team.rank == plan->domain_ranks[state->rank] &&
               aligned_layout;
   }
   int all_capable = 0;
@@ -272,7 +276,7 @@ inline SetupResult prepare(State *state, int *argc, char ***argv,
     else
       print_skip(*state,
                  "this placement does not provide aligned, contiguous LSA "
-                 "teams and railed GIN across at least two nodes");
+                 "teams and railed GIN across at least two LSA domains");
     return SetupResult::Skipped;
   }
 
@@ -285,11 +289,11 @@ inline SetupResult prepare(State *state, int *argc, char ***argv,
   if (backend == Backend::HybridRail) {
     state->hybrid_slot_bytes =
         align_bytes(plan->max_pair_count * sizeof(value_type));
-    state->hybrid_node_bytes =
+    state->hybrid_domain_bytes =
         state->lsa_team.nRanks * state->hybrid_slot_bytes;
     state->staging_bytes =
         std::max<std::size_t>(1, state->rail_team.nRanks *
-                                    state->hybrid_node_bytes);
+                                    state->hybrid_domain_bytes);
   }
 
   ALLTOALLV_NCCL_CHECK(ncclMemAlloc(&state->send, state->send_bytes));
@@ -364,6 +368,11 @@ inline SetupResult prepare(State *state, int *argc, char ***argv,
         static_cast<int>(properties.deviceApiSupport),
         static_cast<int>(properties.ginType),
         static_cast<int>(properties.railedGinType));
+    if (backend != Backend::Lsa) {
+      std::printf("NCCL GIN contexts: requested=%d, created=%u\n",
+                  requirements.ginContextCount,
+                  state->dev_comm.ginContextCount);
+    }
   }
   return SetupResult::Ready;
 }

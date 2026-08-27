@@ -66,7 +66,7 @@ __global__ void nccl_lsa_alltoallv_kernel(ncclDevComm dev_comm,
     copy_segment(source, destination, entry.send_count);
   }
 
-  barrier.sync(ncclCoopCta(), cuda::memory_order_release);
+  barrier.sync(ncclCoopCta(), cuda::memory_order_acq_rel);
 #endif
 }
 

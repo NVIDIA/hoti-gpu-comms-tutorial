@@ -29,9 +29,11 @@ nvshmem_ptr(receive address, destination)
         `-- null:     chunked QP-specific puts-with-signal (network path)
 ```
 
-On a single node, directly mapped peers normally take the first path. PEs on
-different nodes take the network path. A multi-node run with several PEs per
-node uses both paths from the same kernel.
+The direct domain is defined by `nvshmem_ptr`, not by Linux host boundaries.
+It often follows NVLink reachability, and on an NVL72 it can span several
+hosts. Peers that are not directly mapped take the network path. A run that
+contains direct peers and peers outside that domain uses both paths from the
+same kernel.
 
 Direct and network transfers use different chunk sizes. The smaller direct
 chunks give many CTAs work on the NVLink path. Network chunks are larger so
@@ -39,12 +41,14 @@ an IBGDA transport has enough independent operations to use its available
 QPs and NICs without turning a large message into thousands of tiny RMAs.
 Both paths remain in one kernel and use the same completion protocol.
 
-The setup collectively requests several NVSHMEM QP handles and copies those
-handles to the GPU. Network chunks choose a handle from both their destination
-and chunk index. On an IBGDA system with several selected HCAs, that lets
-different chunks use different rails. A transport that does not provide a
-custom QP returns `NVSHMEMX_QP_DEFAULT`; the same device call then falls back
-to the default NVSHMEM path.
+The setup collectively requests NVSHMEM QP handles and copies them to the GPU.
+Network chunks choose a handle from both their destination and chunk index. On
+an IBGDA system with several selected HCAs, that lets different chunks use
+different rails. A transport that does not provide a custom QP returns
+`NVSHMEMX_QP_DEFAULT`; the same device call then falls back to the default
+NVSHMEM path. Unless `NETWORK_QPS` is set, the program requests 16 QPs for a
+network-only run, eight for a mixed run, and one unused handle for a
+direct-only run.
 
 Each call begins with a block-scoped world barrier on the same CUDA stream.
 That handshake says every PE has finished consuming the previous receive
@@ -52,15 +56,39 @@ buffer before any PE can overwrite it. Every direct or network chunk has a
 separate signal slot. The nonblocking put-with-signal orders its payload before
 its signal without quieting after every chunk. A second kernel waits for the
 signal counts the senders supplied during setup before the CUDA stream can
-consume the buffer. While those receiver waits are running, one thread quiets
-all default and custom QPs. The waits make the local receive buffer ready,
-while the all-QP quiet makes the local send buffer safe to reuse. Signal values
+consume the buffer. That kernel also quiets all default and custom QPs so the
+local send buffer is safe to reuse. The network put itself is always
+issued by one thread; only the cooperation used by `quiet` changes. A
+direct-only run uses thread-scoped quiet, a network-only run uses warp-scoped
+quiet, and a mixed run uses block-scoped quiet. The choice is collective and
+is made once from the routes reported by `nvshmem_ptr`.
+
+Signals and quiet answer different questions. The receiver waits for signals
+before reading its local receive buffer. Quiet is local to the sender and
+makes its source buffer reusable; it does not notify a receiver. Signal values
 increase on every iteration, so the benchmark reuses the signal table without
 clearing it. The entry barrier in the next call prevents any PE from
 overwriting a receive buffer while another PE is still consuming the previous
 result. Issuing an NBI operation alone is not a completion guarantee.
 The [NVSHMEM signaling reference](https://docs.nvidia.com/nvshmem/api/latest/gen/api/signal.html)
 defines the payload-before-signal guarantee used here.
+
+## The three tuning steps
+
+Start with one correct put-with-signal per message, then make three changes:
+
+1. Split long messages into chunks so several CTAs can work at once. Direct
+   peers use 256 KiB chunks; network peers use 4 MiB chunks.
+2. Route each chunk with `nvshmem_ptr`. Directly mapped peers use the ordinary
+   block put-with-signal, while unmapped peers use an explicit QP so IBGDA can
+   initiate the transfer from the GPU.
+3. Spread network chunks over several QPs and cooperate on the final quiet.
+   The QP index includes both the destination and chunk number, and the quiet
+   scope changes with the route mix.
+
+Each step changes one visible part of the code. Chunk sizes, QP count, CTA
+count, and quiet scope are printed before the timing result, so a performance
+comparison can be tied back to the mechanism that changed.
 
 ## Device route setup
 
@@ -122,51 +150,84 @@ make run_SOLVED NP=4 \
 ```
 
 `CHUNK_BYTES` controls direct-path and self-copy chunks;
-`NETWORK_CHUNK_BYTES` controls the larger network chunks, and `NETWORK_QPS`
-controls how many QP handles are requested collectively. Chunk sizes accept
-the same `K`, `M`, and `G` suffixes as `--bytes-per-rank` and must be multiples
-of 16 bytes. `NETWORK_QPS` must be positive and identical on every PE:
+`NETWORK_CHUNK_BYTES` controls the larger network chunks. `NETWORK_QPS` can
+override the route-based QP default. Chunk sizes accept the same `K`, `M`, and
+`G` suffixes as `--bytes-per-rank` and must be multiples of 16 bytes. An
+explicit `NETWORK_QPS` value must be positive and identical on every PE:
 
 ```bash
 make run_SOLVED NP=4 \
-  CHUNK_BYTES=256K NETWORK_CHUNK_BYTES=8M NETWORK_QPS=8
+  CHUNK_BYTES=256K NETWORK_CHUNK_BYTES=4M NETWORK_QPS=8
 ```
 
-Placement determines which transport paths the kernel exercises. With a
-Slurm allocation, representative launch shapes are:
+Placement determines which transport paths the kernel exercises. On Lyris,
+the following allocation shapes select the three cases used in the
+performance comparison:
 
 ```bash
-# NVLink/direct peer paths within one node
-make run_SOLVED NP=4 \
-  LAUNCHER="srun --nodes=1 --ntasks=4 --gpus-per-task=1" \
-  RUN_ARGS="--pattern offdiagonal --bytes-per-rank 64M --blocks 128 --warmup 20 --iters 200"
+# Direct only: eight PEs in one NVL72, spread over two compute trays
+make run_SOLVED NP=8 \
+  LAUNCHER="srun --mpi=pmix_v5 --nodes=2 --ntasks=8 --ntasks-per-node=4 --segment=2 --cpu-bind=none" \
+  RUN_ARGS="--pattern offdiagonal --bytes-per-rank 256M --blocks 128 --threads 256 --warmup 20 --iters 100"
 
-# InfiniBand: one PE and GPU on each of two nodes
-make run_SOLVED NP=2 \
-  LAUNCHER="srun --nodes=2 --ntasks=2 --ntasks-per-node=1 --gpus-per-task=1" \
-  RUN_ARGS="--pattern offdiagonal --bytes-per-rank 64M --blocks 128 --warmup 50 --iters 1000"
-
-# Mixed: two direct peers per node and InfiniBand between nodes
+# Network only: one PE in each of four NVL72 systems
 make run_SOLVED NP=4 \
-  LAUNCHER="srun --nodes=2 --ntasks=4 --ntasks-per-node=2 --gpus-per-task=1" \
-  RUN_ARGS="--pattern offdiagonal --bytes-per-rank 64M --blocks 64 --warmup 50 --iters 500"
+  LAUNCHER="srun --mpi=pmix_v5 --nodes=4 --ntasks=4 --ntasks-per-node=1 --segment=1 --spread-segments --cpu-bind=none" \
+  RUN_ARGS="--pattern offdiagonal --bytes-per-rank 256M --blocks 128 --threads 256 --warmup 20 --iters 100"
+
+# Mixed: eight direct peers per NVL72 and network traffic between two NVL72s
+make run_SOLVED NP=16 \
+  LAUNCHER="srun --mpi=pmix_v5 --nodes=4 --ntasks=16 --ntasks-per-node=4 --segment=2 --spread-segments --cpu-bind=none" \
+  RUN_ARGS="--pattern offdiagonal --bytes-per-rank 256M --blocks 128 --threads 256 --warmup 20 --iters 100"
 ```
 
-Use the node and task counts allowed by the current allocation. NVSHMEM must
-be built with an InfiniBand transport for the inter-node forms. The tutorial
-`env.sh` selects MPI bootstrap and IBRC on JUPITER. IBRC is the compatible
-proxy-backed baseline; on an installation built for IBGDA, set
+The `--segment` and `--spread-segments` options are Lyris allocation controls.
+Check the site documentation before copying them to another cluster. If the
+command is launched from inside an existing `srun` step, add `--overlap`.
+
+NVSHMEM must be built with an InfiniBand transport for the network forms. The
+tutorial `env.sh` selects MPI bootstrap and IBRC on JUPITER. IBRC is the
+compatible proxy-backed baseline; on an installation built for IBGDA, set
 `NVSHMEM_IB_ENABLE_IBGDA=1` to run the same kernel with GPU-initiated network
 progress. No source change is required.
 
-The two-node offdiagonal run should report `0 direct, 2 network`. The two-node,
-two-PE-per-node run should report `4 direct, 8 network`. Those counts verify
-the intended placement before interpreting the timing number. In a mixed run,
+The network-only run should report `0 direct, 12 network`. The 16-PE mixed run
+should report `112 direct, 128 network`. Those counts verify the intended
+placement before interpreting the timing number. In a mixed run,
 the logical non-self rate includes both direct and network payload bytes. The
-placement breakdown separates same-host and inter-host bytes; confirm the
-actual route with the `NVSHMEM routes` line before treating inter-host bytes as
-InfiniBand traffic. Multi-node NVLink systems can map an inter-host peer
-directly.
+placement breakdown separates directly mapped peers from cross-domain peers;
+confirm the actual route with the `NVSHMEM routes` line before treating
+cross-domain bytes as InfiniBand traffic. Multi-node NVLink systems can map an
+inter-host peer directly. Direct and network payload totals use the exact
+outgoing `nvshmem_ptr` decisions. The smaller "different domain rank"
+subcategory assumes the direct peers form symmetric domains, as they do on
+the NVL72 allocation used here.
+
+## Reference measurement on Lyris
+
+The table below uses 256 MiB per PE, 128 CTAs, 256 threads per CTA, a 256 KiB
+direct chunk, and a 4 MiB network chunk. The reported bandwidth counts each
+non-self payload byte once at the sender.
+
+| Placement | PEs | Measured | Raw send ceiling | Raw ceiling reached |
+| --- | ---: | ---: | ---: | ---: |
+| One NVL72, direct only | 8 | 3.76 TB/s | 7.2 TB/s | 52% |
+| Four NVL72s, one 800 Gb/s rail per PE | 4 | 205.7 GB/s | 400 GB/s | 51% |
+| Two NVL72s, direct plus one network rail per PE | 16 | 1.52 TB/s | 3.0 TB/s | 51% |
+
+The raw NVLink number uses half of the documented 1.8 TB/s bidirectional
+bandwidth per GPU because this benchmark counts sent bytes, not both link
+directions. An 800 Gb/s ConnectX-8 link contributes 100 GB/s of send bandwidth.
+For the mixed case, 7/15 of the payload is direct and 8/15 is network traffic;
+the 3.0 TB/s ceiling assumes those paths overlap and the network portion is
+the longer one. See the
+[NVL72 reference architecture](https://docs.nvidia.com/enterprise-reference-architectures/nvl72-ai-factory/latest/components.html)
+and the [GB300 NVL72 system specifications](https://www.nvidia.com/en-us/data-center/gb300-nvl72/).
+
+These are application-level ceilings, not promises for every message size.
+Put-with-signal processing, the entry barrier, completion, and routing balance
+all reduce the application rate. Measure a matching direct copy or put on the
+same allocation and report both the primitive and raw-hardware percentages.
 
 ## Exercise
 
@@ -182,7 +243,9 @@ Complete the three communication functions in `nvshmem_alltoallv.cu`.
    put-and-signal. Select the handle from the destination and chunk index.
 3. In `wait_for_chunks`, wait for the signal count exchanged by each source.
    Use the source PE and chunk index to address the correct signal slot, and
-   have one thread quiet all QPs so the sender can safely reuse its input.
+   quiet all QPs so the sender can safely reuse its input. Use the supplied
+   scope: one thread for an all-direct placement, one warp for network-only,
+   or the whole block when direct and network routes are mixed.
 
 The APIs used in those functions are:
 
@@ -211,6 +274,12 @@ uint64_t nvshmem_signal_wait_until(
 void nvshmemx_qp_quiet(
     int pe, nvshmemx_qp_handle_t *qps, int num_qps);
 
+void nvshmemx_qp_quiet_warp(
+    int pe, nvshmemx_qp_handle_t *qps, int num_qps);
+
+void nvshmemx_qp_quiet_block(
+    int pe, nvshmemx_qp_handle_t *qps, int num_qps);
+
 void nvshmemx_barrier_all_block();
 ```
 
@@ -226,9 +295,9 @@ defines the handle fallback, lifetime, and synchronization rules.
 The setup, entry-barrier, and wait kernels are launched with
 `nvshmemx_collective_launch`. The wait kernel uses NVSHMEM synchronization
 APIs, and the other two contain block collectives. The multi-CTA send phase
-uses an ordinary CUDA launch and completes before the one-CTA wait phase is
-launched on the same stream. Waiting CTAs therefore cannot block unscheduled
-send CTAs. See the
+uses an ordinary CUDA launch. The one-CTA wait phase is queued after it on the
+same stream and cannot begin execution until the send phase completes. Waiting
+CTAs therefore cannot block unscheduled send CTAs. See the
 [collective-launch contract](https://docs.nvidia.com/nvshmem/api/latest/api/launch.html)
 for the residency requirement behind this split.
 
@@ -239,11 +308,11 @@ NVSHMEM device plan: PASS
 NVSHMEM routes: ... direct, ... network
 NVSHMEM AlltoAllV correctness: PASS
 NVSHMEM AlltoAllV performance: ... ms/iteration, ... GB/s logical non-self
-NVSHMEM AlltoAllV placement payload rates: ... GB/s same-host non-self, ... GB/s inter-host
+NVSHMEM AlltoAllV placement payload rates (NVSHMEM direct peer): ... GB/s same-domain non-self, ... GB/s cross-domain
 ```
 
 This lab implements an out-of-place collective for 32-bit values. The route
 plan is rebuilt when the counts change, and the fixed chunk size is a tuning
 parameter rather than an automatic policy. The traffic summary and split
-payload rates describe MPI rank placement. The route summary reports what
-`nvshmem_ptr` actually mapped directly and what used the network path.
+payload rates use the direct-peer domains reported by `nvshmem_ptr`. The route
+summary reports what was mapped directly and what used the network path.

@@ -11,6 +11,7 @@
 
 #include "../nccl_alltoallv_setup.hpp"
 
+#include <algorithm>
 #include <cstdint>
 
 namespace {
@@ -24,6 +25,13 @@ struct Shard {
   std::uint64_t count;
 };
 
+struct RouteWork {
+  int peer;
+  int source;
+  int shard;
+  int shards;
+};
+
 __device__ Shard shard_for(std::uint64_t count, int shard, int shards) {
   const std::uint64_t quotient = count / static_cast<std::uint64_t>(shards);
   const std::uint64_t remainder = count % static_cast<std::uint64_t>(shards);
@@ -34,6 +42,20 @@ __device__ Shard shard_for(std::uint64_t count, int shard, int shards) {
   return Shard{begin, quotient + (shard_index < remainder ? 1 : 0)};
 }
 
+__device__ RouteWork route_work(ncclTeam world) {
+  const int route_count = max(world.nRanks - 1, 1);
+  const int rounds = gridDim.x / route_count;
+  const int tail = gridDim.x % route_count;
+  const int round = blockIdx.x / route_count;
+  const int slot = blockIdx.x % route_count;
+  const int route = (slot + round) % route_count;
+  const int tail_slot =
+      (route - (rounds % route_count) + route_count) % route_count;
+  return RouteWork{(world.rank + 1 + route) % world.nRanks,
+                   (world.rank - 1 - route + world.nRanks) % world.nRanks,
+                   round, rounds + (tail_slot < tail ? 1 : 0)};
+}
+
 __global__ void nccl_gin_alltoallv_kernel(ncclDevComm dev_comm,
                                           ncclWindow_t send_window,
                                           ncclWindow_t recv_window,
@@ -42,11 +64,11 @@ __global__ void nccl_gin_alltoallv_kernel(ncclDevComm dev_comm,
   const ncclTeam world = ncclTeamWorld(dev_comm);
   const DevicePlanEntry *entries =
       static_cast<const DevicePlanEntry *>(ncclGetLocalPointer(plan_window, 0));
+  const RouteWork work = route_work(world);
   const int context_count =
       min(static_cast<int>(gridDim.x),
           static_cast<int>(dev_comm.ginContextCount));
-  const int context =
-      static_cast<int>(blockIdx.x) * context_count / gridDim.x;
+  const int context = static_cast<int>(blockIdx.x) % context_count;
   ncclGin gin(dev_comm, context);
   const ncclGinSignal_t signal = static_cast<ncclGinSignal_t>(blockIdx.x);
   const std::uint64_t signal_before = gin.readSignal(signal);
@@ -57,27 +79,36 @@ __global__ void nccl_gin_alltoallv_kernel(ncclDevComm dev_comm,
                ncclGinFenceLevel::None);
 
   if (threadIdx.x == 0) {
-    for (int step = 0; step < world.nRanks; ++step) {
-      const int peer = (world.rank + step) % world.nRanks;
-      const DevicePlanEntry entry = entries[peer];
-      const Shard shard = shard_for(entry.send_count, blockIdx.x, gridDim.x);
-      if (shard.count == 0)
-        continue;
-      gin.put(world, peer, recv_window,
+    const DevicePlanEntry entry = entries[work.peer];
+    const Shard shard =
+        shard_for(entry.send_count, work.shard, work.shards);
+    if (world.nRanks > 1 && shard.count != 0) {
+      gin.put(world, work.peer, recv_window,
               (entry.remote_recv_offset + shard.begin) * sizeof(value_type),
               send_window,
               (entry.send_offset + shard.begin) * sizeof(value_type),
               shard.count * sizeof(value_type), ncclGin_WeakSignalInc{signal});
     }
   }
+
+  const DevicePlanEntry self = entries[world.rank];
+  const Shard self_shard =
+      shard_for(self.send_count, blockIdx.x, gridDim.x);
+  const value_type *send = static_cast<const value_type *>(
+      ncclGetLocalPointer(send_window, 0));
+  value_type *recv =
+      static_cast<value_type *>(ncclGetLocalPointer(recv_window, 0));
+  for (std::uint64_t index = threadIdx.x; index < self_shard.count;
+       index += blockDim.x) {
+    recv[self.recv_offset + self_shard.begin + index] =
+        send[self.send_offset + self_shard.begin + index];
+  }
   __syncthreads();
 
-  std::uint64_t expected = 0;
-  for (int source = 0; source < world.nRanks; ++source) {
-    const Shard shard =
-        shard_for(entries[source].recv_count, blockIdx.x, gridDim.x);
-    expected += shard.count != 0;
-  }
+  const Shard incoming =
+      shard_for(entries[work.source].recv_count, work.shard, work.shards);
+  const std::uint64_t expected =
+      world.nRanks > 1 && incoming.count != 0;
   gin.waitSignal(ncclCoopCta(), signal, signal_before + expected);
   gin.flush(ncclCoopCta());
 
@@ -86,7 +117,8 @@ __global__ void nccl_gin_alltoallv_kernel(ncclDevComm dev_comm,
 #endif
 }
 
-void require_matching_launch(const alltoallv::Options &options, int rank) {
+void require_matching_launch(const alltoallv::Options &options, int rank,
+                             int size) {
   int values[2] = {options.blocks, options.threads};
   int minima[2];
   int maxima[2];
@@ -99,6 +131,12 @@ void require_matching_launch(const alltoallv::Options &options, int rank) {
   if (minima[0] != maxima[0] || minima[1] != maxima[1]) {
     if (rank == 0)
       std::fprintf(stderr, "--blocks and --threads must match on every rank\n");
+    MPI_Abort(MPI_COMM_WORLD, 1);
+  }
+  if (options.blocks < std::max(size - 1, 1)) {
+    if (rank == 0)
+      std::fprintf(stderr,
+                   "--blocks must be at least ranks minus one\n");
     MPI_Abort(MPI_COMM_WORLD, 1);
   }
 }
@@ -123,7 +161,7 @@ int main(int argc, char **argv) {
     return 0;
   }
 
-  require_matching_launch(options, state.rank);
+  require_matching_launch(options, state.rank, state.size);
   alltoallv::print_plan(plan, options, "NCCL GIN AlltoAllV");
 
   launch_alltoallv(state, options);

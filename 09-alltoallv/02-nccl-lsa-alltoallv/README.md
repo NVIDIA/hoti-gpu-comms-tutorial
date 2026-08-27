@@ -36,14 +36,15 @@ For each LSA peer, the kernel:
 
 The peer order is offset by both the source rank and the CTA index. At a given
 step, different sources write different destinations, and different CTAs do
-not all work on the same peer at once. This matters because every CTA owns a
-different slice of every message; changing the visit order does not change
-which bytes it copies.
+not all work on the same peer at once. Every CTA owns a different slice of
+every message, so changing the visit order does not change which bytes it
+copies.
 
 The kernel uses one LSA barrier per CTA. The acquire barrier at entry ensures
-that every rank has entered the operation before stores begin. The release
-barrier at exit publishes the peer stores before the receiving kernel returns
-to its CUDA stream. This lab requests ordinary LSA barriers and passes
+that every rank has entered the operation before stores begin. The
+acquire-release barrier at exit publishes this rank's peer stores and ensures
+that stores from the other ranks are visible before the receiving kernel
+returns to its CUDA stream. This lab requests ordinary LSA barriers and passes
 `multimem=false`; it does not require NVLS or multimem instructions.
 
 The relevant NCCL 2.31.2 device APIs are:
@@ -65,8 +66,8 @@ int ncclTeamRankToWorld(
 ```
 
 `ncclGetLsaPointer` takes an LSA-team rank, while the plan is indexed by world
-rank. Keeping that distinction explicit matters once a communicator contains
-more than one node, even though this exercise requires one LSA team.
+rank. Convert the LSA peer to a world rank before indexing the plan; do not
+assume the two rank spaces have the same numbering.
 
 ## Exercise
 
@@ -76,7 +77,7 @@ Open `nccl_lsa_alltoallv.cu` and complete the TODOs in
 1. enter the per-CTA LSA barrier with acquire ordering;
 2. obtain the local source pointer and the peer receive pointer for each plan
    entry, then call the supplied vector-copy helper;
-3. leave the barrier with release ordering.
+3. leave the barrier with acquire-release ordering.
 
 All allocation, collective window registration, plan construction, warmup,
 timing, and full-buffer validation are already present. Compare with
@@ -104,6 +105,19 @@ make run_SOLVED NP=4 \
   RUN_ARGS="--blocks 128"
 ```
 
+On Lyris, eight GPUs across two trays in one NVL72 form one LSA domain. Lyris
+does not expose GPU GRES, so omit `--gpus-per-task`:
+
+```bash
+make run_SOLVED NP=8 \
+  LAUNCHER="srun --mpi=pmix_v5 --nodes=2 --ntasks=8 --ntasks-per-node=4 --segment=2" \
+  RUN_ARGS="--pattern offdiagonal --bytes-per-rank 256M --blocks 1024 --threads 256 --warmup 20 --iters 100"
+```
+
+The `1024 x 256` launch was the best 256 MiB/rank starting point in the Lyris
+sweep used for this lab. Sweep the CTA count again on another GPU, message
+size, or LSA topology.
+
 Change the traffic pattern and payload with `RUN_ARGS`:
 
 ```bash
@@ -124,7 +138,7 @@ than attempting invalid peer accesses. A successful run ends with output like:
 NCCL topology: world=4, LSA=4, rail=1
 NCCL LSA AlltoAllV correctness: PASS
 NCCL LSA AlltoAllV performance: ... ms/iteration, ... GB/s logical non-self
-NCCL LSA AlltoAllV placement payload rates: ... GB/s same-host non-self, 0.000 GB/s inter-host
+NCCL LSA AlltoAllV placement payload rates (NCCL LSA): ... GB/s same-domain non-self, 0.000 GB/s cross-domain
 ```
 
 The reported bandwidth counts payload sent to other ranks and uses the

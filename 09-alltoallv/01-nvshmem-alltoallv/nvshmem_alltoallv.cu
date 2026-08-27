@@ -18,9 +18,10 @@ namespace {
 using alltoallv::value_type;
 
 constexpr std::uint64_t kDefaultDirectChunkBytes = 256ull << 10;
-constexpr std::uint64_t kDefaultNetworkChunkBytes = 8ull << 20;
-constexpr int kDefaultNetworkQpCount = 8;
+constexpr std::uint64_t kDefaultNetworkChunkBytes = 4ull << 20;
 constexpr std::uint64_t kMetadataAlignment = 16;
+
+enum class QpQuietScope : int { thread, warp, block };
 
 __device__ std::uint64_t align_bytes(std::uint64_t value) {
   return (value + kMetadataAlignment - 1) & ~(kMetadataAlignment - 1);
@@ -95,17 +96,20 @@ send_chunks(const value_type *send_buffer, value_type *recv_buffer,
 
 __global__ void wait_for_chunks(const std::uint64_t *recv_signal_counts,
                                 std::uint64_t *signals, int rank, int nranks,
-                                std::uint64_t max_chunks, std::uint64_t epoch) {
+                                std::uint64_t max_chunks,
+                                QpQuietScope quiet_scope, std::uint64_t epoch) {
   /*
    * TODO: Wait for the number of source signals supplied by the route-plan
    * exchange. Direct and network peers signal once per route-specific chunk.
-   * After all waits, quiet every default and custom QP before returning.
+   * Cooperatively quiet every default and custom QP using quiet_scope, and
+   * wait for the incoming signals before returning.
    */
   (void)recv_signal_counts;
   (void)signals;
   (void)rank;
   (void)nranks;
   (void)max_chunks;
+  (void)quiet_scope;
   (void)epoch;
 }
 
@@ -138,12 +142,11 @@ std::uint64_t chunk_bytes_from_environment(const char *name,
   return bytes;
 }
 
-int network_qp_count_from_environment(int rank) {
+int network_qp_count_from_environment(int rank, int default_count) {
   const char *name = "HOTI_ALLTOALLV_NETWORK_QPS";
   const char *text = std::getenv(name);
   char *end = nullptr;
-  long value =
-      text == nullptr ? kDefaultNetworkQpCount : std::strtol(text, &end, 10);
+  long value = text == nullptr ? default_count : std::strtol(text, &end, 10);
   if (value < 1 || value > std::numeric_limits<int>::max() ||
       (text != nullptr && (end == text || *end != '\0'))) {
     if (rank == 0)
@@ -193,6 +196,69 @@ void print_route_summary(value_type *recv_buffer, int rank, int nranks) {
                        "MPI_Reduce(network routes)");
   if (rank == 0)
     std::printf("NVSHMEM routes: %d direct, %d network\n", direct, network);
+}
+
+void classify_direct_routes(alltoallv::Plan *plan, value_type *recv_buffer,
+                            int direct_root, int direct_rank) {
+  plan->placement_scope = "NVSHMEM direct peer";
+  plan->domain_roots.resize(plan->size);
+  plan->domain_ranks.resize(plan->size);
+  alltoallv::mpi_check(MPI_Allgather(&direct_root, 1, MPI_INT,
+                                     plan->domain_roots.data(), 1, MPI_INT,
+                                     MPI_COMM_WORLD),
+                       "MPI_Allgather(direct roots)");
+  alltoallv::mpi_check(MPI_Allgather(&direct_rank, 1, MPI_INT,
+                                     plan->domain_ranks.data(), 1, MPI_INT,
+                                     MPI_COMM_WORLD),
+                       "MPI_Allgather(direct ranks)");
+
+  std::vector<int> outgoing_direct(plan->size, 0);
+  std::vector<int> incoming_direct(plan->size, 0);
+  for (int peer = 0; peer < plan->size; ++peer)
+    outgoing_direct[peer] =
+        peer == plan->rank || nvshmem_ptr(recv_buffer, peer) != nullptr;
+  alltoallv::mpi_check(MPI_Alltoall(outgoing_direct.data(), 1, MPI_INT,
+                                    incoming_direct.data(), 1, MPI_INT,
+                                    MPI_COMM_WORLD),
+                       "MPI_Alltoall(direct routes)");
+
+  std::uint64_t local_self = 0;
+  std::uint64_t local_direct = 0;
+  std::uint64_t local_network = 0;
+  std::uint64_t local_offrail = 0;
+  std::uint64_t local_network_recv = 0;
+  for (int peer = 0; peer < plan->size; ++peer) {
+    if (peer == plan->rank) {
+      local_self += plan->send_counts[peer];
+    } else if (outgoing_direct[peer]) {
+      local_direct += plan->send_counts[peer];
+    } else {
+      local_network += plan->send_counts[peer];
+      if (plan->domain_ranks[peer] != plan->domain_ranks[plan->rank])
+        local_offrail += plan->send_counts[peer];
+    }
+    if (peer != plan->rank && !incoming_direct[peer])
+      local_network_recv += plan->recv_counts[peer];
+  }
+
+  std::uint64_t local_classes[4] = {local_self, local_direct, local_network,
+                                    local_offrail};
+  std::uint64_t global_classes[4] = {};
+  alltoallv::mpi_check(MPI_Allreduce(local_classes, global_classes, 4,
+                                     MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD),
+                       "MPI_Allreduce(direct traffic classes)");
+  plan->global_self_elements = global_classes[0];
+  plan->global_local_elements = global_classes[1];
+  plan->global_network_elements = global_classes[2];
+  plan->global_offrail_elements = global_classes[3];
+
+  std::uint64_t local_maxima[2] = {local_network, local_network_recv};
+  std::uint64_t global_maxima[2] = {};
+  alltoallv::mpi_check(MPI_Allreduce(local_maxima, global_maxima, 2,
+                                     MPI_UINT64_T, MPI_MAX, MPI_COMM_WORLD),
+                       "MPI_Allreduce(direct route maxima)");
+  plan->max_network_send_elements = global_maxima[0];
+  plan->max_network_recv_elements = global_maxima[1];
 }
 
 template <typename T> T *symmetric_alloc(std::uint64_t count) {
@@ -301,8 +367,8 @@ void launch_alltoallv(const value_type *send_buffer, value_type *recv_buffer,
                       std::uint64_t network_chunk_bytes,
                       const nvshmemx_qp_handle_t *network_qps,
                       int network_qp_count, std::uint64_t max_chunks,
-                      std::uint64_t epoch, const alltoallv::Options &options,
-                      cudaStream_t stream) {
+                      QpQuietScope quiet_scope, std::uint64_t epoch,
+                      const alltoallv::Options &options, cudaStream_t stream) {
   int unused = 0;
   void *begin_args[] = {&unused};
   int begin_status = nvshmemx_collective_launch(
@@ -318,8 +384,8 @@ void launch_alltoallv(const value_type *send_buffer, value_type *recv_buffer,
       remote_recv_offsets_bytes, signals, rank, nranks, direct_chunk_bytes,
       network_chunk_bytes, network_qps, network_qp_count, max_chunks, epoch);
   CUDA_CHECK(cudaGetLastError());
-  void *args[] = {&recv_signal_counts, &signals, &rank, &nranks,
-                  &max_chunks,         &epoch};
+  void *args[] = {&recv_signal_counts, &signals,     &rank, &nranks,
+                  &max_chunks,         &quiet_scope, &epoch};
   int wait_status = nvshmemx_collective_launch(
       reinterpret_cast<const void *>(wait_for_chunks), dim3(1),
       dim3(options.threads), args, 0, stream);
@@ -371,14 +437,12 @@ int main(int argc, char **argv) {
 
   alltoallv::Plan plan =
       alltoallv::make_plan(context.rank, context.size, options);
-  alltoallv::print_plan(plan, options, "NVSHMEM AlltoAllV");
 
   std::uint64_t direct_chunk_bytes = chunk_bytes_from_environment(
       "HOTI_ALLTOALLV_CHUNK_BYTES", kDefaultDirectChunkBytes, context.rank);
   std::uint64_t network_chunk_bytes =
       chunk_bytes_from_environment("HOTI_ALLTOALLV_NETWORK_CHUNK_BYTES",
                                    kDefaultNetworkChunkBytes, context.rank);
-  int network_qp_count = network_qp_count_from_environment(context.rank);
   std::uint64_t max_pair_bytes = plan.max_pair_count * sizeof(value_type);
   std::uint64_t smallest_chunk_bytes =
       std::min(direct_chunk_bytes, network_chunk_bytes);
@@ -392,20 +456,6 @@ int main(int argc, char **argv) {
   }
   std::uint64_t signal_count =
       static_cast<std::uint64_t>(context.size) * max_chunks;
-
-  nvshmemx_qp_handle_t *host_network_qps = nullptr;
-  int qp_status = nvshmemx_qp_create(network_qp_count, &host_network_qps);
-  if (qp_status != NVSHMEMX_SUCCESS || host_network_qps == nullptr) {
-    if (context.rank == 0)
-      std::fprintf(stderr, "NVSHMEM network QP creation failed: %d\n",
-                   qp_status);
-    MPI_Abort(MPI_COMM_WORLD, qp_status == 0 ? 1 : qp_status);
-  }
-  nvshmemx_qp_handle_t *network_qps = nullptr;
-  CUDA_CHECK(cudaMalloc(&network_qps, network_qp_count * sizeof(*network_qps)));
-  CUDA_CHECK(cudaMemcpy(network_qps, host_network_qps,
-                        network_qp_count * sizeof(*network_qps),
-                        cudaMemcpyHostToDevice));
 
   value_type *send_buffer =
       symmetric_alloc<value_type>(plan.global_send_capacity);
@@ -437,6 +487,55 @@ int main(int argc, char **argv) {
       std::fprintf(stderr, "NVSHMEM symmetric allocation failed\n");
     MPI_Abort(MPI_COMM_WORLD, 1);
   }
+
+  int direct_root = context.rank;
+  int direct_rank = 0;
+  int local_direct_peers = 0;
+  int local_network_peers = 0;
+  for (int peer = 0; peer < context.size; ++peer) {
+    bool direct =
+        peer == context.rank || nvshmem_ptr(recv_buffer, peer) != nullptr;
+    if (direct) {
+      direct_root = std::min(direct_root, peer);
+      direct_rank += peer < context.rank;
+    }
+    if (peer != context.rank) {
+      local_direct_peers += direct;
+      local_network_peers += !direct;
+    }
+  }
+  int any_direct = 0;
+  int any_network = 0;
+  alltoallv::mpi_check(MPI_Allreduce(&local_direct_peers, &any_direct, 1,
+                                     MPI_INT, MPI_MAX, MPI_COMM_WORLD),
+                       "MPI_Allreduce(direct routes)");
+  alltoallv::mpi_check(MPI_Allreduce(&local_network_peers, &any_network, 1,
+                                     MPI_INT, MPI_MAX, MPI_COMM_WORLD),
+                       "MPI_Allreduce(network routes)");
+  QpQuietScope quiet_scope =
+      any_direct && any_network
+          ? QpQuietScope::block
+          : (any_network ? QpQuietScope::warp : QpQuietScope::thread);
+  int default_network_qp_count = any_network ? (any_direct ? 8 : 16) : 1;
+  int network_qp_count =
+      network_qp_count_from_environment(context.rank, default_network_qp_count);
+
+  nvshmemx_qp_handle_t *host_network_qps = nullptr;
+  int qp_status = nvshmemx_qp_create(network_qp_count, &host_network_qps);
+  if (qp_status != NVSHMEMX_SUCCESS || host_network_qps == nullptr) {
+    if (context.rank == 0)
+      std::fprintf(stderr, "NVSHMEM network QP creation failed: %d\n",
+                   qp_status);
+    MPI_Abort(MPI_COMM_WORLD, qp_status == 0 ? 1 : qp_status);
+  }
+  nvshmemx_qp_handle_t *network_qps = nullptr;
+  CUDA_CHECK(cudaMalloc(&network_qps, network_qp_count * sizeof(*network_qps)));
+  CUDA_CHECK(cudaMemcpy(network_qps, host_network_qps,
+                        network_qp_count * sizeof(*network_qps),
+                        cudaMemcpyHostToDevice));
+
+  classify_direct_routes(&plan, recv_buffer, direct_root, direct_rank);
+  alltoallv::print_plan(plan, options, "NVSHMEM AlltoAllV");
 
   std::vector<value_type> host_send = alltoallv::make_send_buffer(plan);
   std::vector<std::uint64_t> host_send_counts_bytes(context.size);
@@ -515,15 +614,21 @@ int main(int argc, char **argv) {
       explicit_qps += host_network_qps[index] != NVSHMEMX_QP_DEFAULT;
     std::printf("NVSHMEM network QPs: requested=%d, explicit=%d\n",
                 network_qp_count, explicit_qps);
+    const char *quiet_name =
+        quiet_scope == QpQuietScope::block
+            ? "block"
+            : (quiet_scope == QpQuietScope::warp ? "warp" : "thread");
+    std::printf("NVSHMEM completion quiet: %s scoped\n", quiet_name);
   }
   print_route_summary(recv_buffer, context.rank, context.size);
 
   std::uint64_t epoch = 1;
-  launch_alltoallv(
-      send_buffer, recv_buffer, send_counts_bytes, send_offsets_bytes,
-      recv_signal_counts, remote_recv_offsets_bytes, signals, context.rank,
-      context.size, direct_chunk_bytes, network_chunk_bytes, network_qps,
-      network_qp_count, max_chunks, epoch++, options, context.stream);
+  launch_alltoallv(send_buffer, recv_buffer, send_counts_bytes,
+                   send_offsets_bytes, recv_signal_counts,
+                   remote_recv_offsets_bytes, signals, context.rank,
+                   context.size, direct_chunk_bytes, network_chunk_bytes,
+                   network_qps, network_qp_count, max_chunks, quiet_scope,
+                   epoch++, options, context.stream);
   CUDA_CHECK(cudaStreamSynchronize(context.stream));
 
   std::vector<value_type> observed(plan.global_recv_capacity);
@@ -542,11 +647,12 @@ int main(int argc, char **argv) {
   }
 
   for (int iteration = 0; iteration < options.warmup; ++iteration) {
-    launch_alltoallv(
-        send_buffer, recv_buffer, send_counts_bytes, send_offsets_bytes,
-        recv_signal_counts, remote_recv_offsets_bytes, signals, context.rank,
-        context.size, direct_chunk_bytes, network_chunk_bytes, network_qps,
-        network_qp_count, max_chunks, epoch++, options, context.stream);
+    launch_alltoallv(send_buffer, recv_buffer, send_counts_bytes,
+                     send_offsets_bytes, recv_signal_counts,
+                     remote_recv_offsets_bytes, signals, context.rank,
+                     context.size, direct_chunk_bytes, network_chunk_bytes,
+                     network_qps, network_qp_count, max_chunks, quiet_scope,
+                     epoch++, options, context.stream);
   }
   CUDA_CHECK(cudaStreamSynchronize(context.stream));
   alltoallv::mpi_check(MPI_Barrier(MPI_COMM_WORLD), "MPI_Barrier(timing)");
@@ -557,11 +663,12 @@ int main(int argc, char **argv) {
   CUDA_CHECK(cudaEventCreate(&stop));
   CUDA_CHECK(cudaEventRecord(start, context.stream));
   for (int iteration = 0; iteration < options.iterations; ++iteration) {
-    launch_alltoallv(
-        send_buffer, recv_buffer, send_counts_bytes, send_offsets_bytes,
-        recv_signal_counts, remote_recv_offsets_bytes, signals, context.rank,
-        context.size, direct_chunk_bytes, network_chunk_bytes, network_qps,
-        network_qp_count, max_chunks, epoch++, options, context.stream);
+    launch_alltoallv(send_buffer, recv_buffer, send_counts_bytes,
+                     send_offsets_bytes, recv_signal_counts,
+                     remote_recv_offsets_bytes, signals, context.rank,
+                     context.size, direct_chunk_bytes, network_chunk_bytes,
+                     network_qps, network_qp_count, max_chunks, quiet_scope,
+                     epoch++, options, context.stream);
   }
   CUDA_CHECK(cudaEventRecord(stop, context.stream));
   CUDA_CHECK(cudaEventSynchronize(stop));
@@ -574,11 +681,12 @@ int main(int argc, char **argv) {
   CUDA_CHECK(cudaMemsetAsync(recv_buffer, 0xa5,
                              plan.global_recv_capacity * sizeof(value_type),
                              context.stream));
-  launch_alltoallv(
-      send_buffer, recv_buffer, send_counts_bytes, send_offsets_bytes,
-      recv_signal_counts, remote_recv_offsets_bytes, signals, context.rank,
-      context.size, direct_chunk_bytes, network_chunk_bytes, network_qps,
-      network_qp_count, max_chunks, epoch++, options, context.stream);
+  launch_alltoallv(send_buffer, recv_buffer, send_counts_bytes,
+                   send_offsets_bytes, recv_signal_counts,
+                   remote_recv_offsets_bytes, signals, context.rank,
+                   context.size, direct_chunk_bytes, network_chunk_bytes,
+                   network_qps, network_qp_count, max_chunks, quiet_scope,
+                   epoch++, options, context.stream);
   CUDA_CHECK(cudaStreamSynchronize(context.stream));
   CUDA_CHECK(cudaMemcpy(observed.data(), recv_buffer,
                         plan.global_recv_capacity * sizeof(value_type),
