@@ -193,8 +193,7 @@ int main(int argc, char **argv) {
   ALLTOALLV_CUDA_CHECK(cudaEventDestroy(start));
   ALLTOALLV_CUDA_CHECK(cudaEventDestroy(stop));
 
-  ALLTOALLV_CUDA_CHECK(
-      cudaMemsetAsync(state.recv, 0xa5, state.recv_bytes, state.stream));
+  alltoallv::nccl_setup::clear_recv_for_reuse(&state);
   launch_alltoallv(state, options);
   ALLTOALLV_CUDA_CHECK(cudaStreamSynchronize(state.stream));
   errors = alltoallv::nccl_setup::copy_and_validate(
