@@ -6,7 +6,7 @@ JSC_SUBMIT_CMD ?= $(MPIRUN)
 LAUNCHER ?= $(JSC_SUBMIT_CMD) -n $(NP)
 CUDA_HOME ?= /usr/local/cuda
 NCCL_HOME ?= /usr
-CUDA_ARCH ?= 90
+include ../alltoallv_build.mk
 CUDA_VISIBLE_DEVICES ?=
 RUN_ARGS ?=
 NCCL_IB_MERGE_NICS ?= 0
@@ -17,7 +17,7 @@ RUN_ENV = LD_LIBRARY_PATH=$(NCCL_HOME)/lib:$(CUDA_HOME)/lib64:$(LD_LIBRARY_PATH)
 	$(if $(strip $(CUDA_VISIBLE_DEVICES)),CUDA_VISIBLE_DEVICES=$(CUDA_VISIBLE_DEVICES))
 
 CPPFLAGS += -I.. -I$(CUDA_HOME)/include -I$(NCCL_HOME)/include
-NVCCFLAGS += -O3 -std=c++17 -rdc=true -gencode arch=compute_$(CUDA_ARCH),code=sm_$(CUDA_ARCH)
+NVCCFLAGS += -O3 -std=c++17 -rdc=true $(GENCODE_FLAGS)
 LDFLAGS += -L$(CUDA_HOME)/lib64 -L$(NCCL_HOME)/lib
 LDLIBS += -lcudart -lcuda -lnccl
 

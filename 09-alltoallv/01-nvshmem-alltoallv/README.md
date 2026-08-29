@@ -123,12 +123,15 @@ installation with the explicit-QP APIs and `NVSHMEMX_QP_ALL`:
 export NVSHMEM_HOME=/path/to/nvshmem
 export LD_LIBRARY_PATH="$NVSHMEM_HOME/lib:$LD_LIBRARY_PATH"
 
-make CUDA_ARCH=90
+make
 ```
 
-The Makefile builds the starter and `_SOLVED` reference. It defaults to
-`CUDA_ARCH=90` for the GH200 tutorial systems and uses GNU Make like the other
-C/CUDA exercises.
+The Makefile builds native `sm_100` code plus `compute_100` PTX, matching the
+GB200 and GB300 NVL72 target. To build a portable teaching-machine fat binary
+with a CUDA toolkit that supports both architectures, use
+`make CUDA_ARCHS='90 100'`. For a GH200-only system, use
+`make CUDA_ARCH=90`. The Makefile builds the starter and `_SOLVED` reference
+and otherwise uses GNU Make like the other C/CUDA exercises.
 
 ## Run
 
@@ -203,7 +206,7 @@ outgoing `nvshmem_ptr` decisions. The smaller "different domain rank"
 subcategory assumes the direct peers form symmetric domains, as they do on
 the NVL72 allocation used here.
 
-## Reference measurement on Lyris
+## Reference measurement on GB300 Lyris
 
 The table below uses 256 MiB per PE, 128 CTAs, 256 threads per CTA, a 256 KiB
 direct chunk, and a 4 MiB network chunk. The reported bandwidth counts each
@@ -212,15 +215,18 @@ non-self payload byte once at the sender.
 | Placement | PEs | Measured | Raw send ceiling | Raw ceiling reached |
 | --- | ---: | ---: | ---: | ---: |
 | One NVL72, direct only | 8 | 3.76 TB/s | 7.2 TB/s | 52% |
-| Four NVL72s, one 800 Gb/s rail per PE | 4 | 205.7 GB/s | 400 GB/s | 51% |
+| Four GB300 NVL72s, one 800 Gb/s rail per PE | 4 | 205.7 GB/s | 400 GB/s | 51% |
 | Two NVL72s, direct plus one network rail per PE | 16 | 1.52 TB/s | 3.0 TB/s | 51% |
 
 The raw NVLink number uses half of the documented 1.8 TB/s bidirectional
 bandwidth per GPU because this benchmark counts sent bytes, not both link
-directions. An 800 Gb/s ConnectX-8 link contributes 100 GB/s of send bandwidth.
-For the mixed case, 7/15 of the payload is direct and 8/15 is network traffic;
-the 3.0 TB/s ceiling assumes those paths overlap and the network portion is
-the longer one. See the
+directions. A selected 800 Gb/s ConnectX-8 rail contributes 100 GB/s of send
+bandwidth. For the mixed case, 7/15 of the payload is direct and 8/15 is
+network traffic; the 3.0 TB/s ceiling assumes those paths overlap and the
+network portion is the longer one. On GB200, a selected 400 Gb/s ConnectX-7
+rail is 50 GB/s, so the corresponding four-PE network and 16-PE hybrid
+ceilings are 0.2 TB/s and 1.5 TB/s. Always calculate the ceiling from the
+active rails and their negotiated speed before comparing a run. See the
 [NVL72 reference architecture](https://docs.nvidia.com/enterprise-reference-architectures/nvl72-ai-factory/latest/components.html)
 and the [GB300 NVL72 system specifications](https://www.nvidia.com/en-us/data-center/gb300-nvl72/).
 

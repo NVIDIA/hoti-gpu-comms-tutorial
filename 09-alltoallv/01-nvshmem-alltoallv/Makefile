@@ -5,7 +5,7 @@ MPIRUN ?= mpirun
 JSC_SUBMIT_CMD ?= $(MPIRUN)
 LAUNCHER ?= $(JSC_SUBMIT_CMD) -n $(NP)
 NVSHMEM_HOME ?=
-CUDA_ARCH ?= 90
+include ../alltoallv_build.mk
 CUDA_VISIBLE_DEVICES ?=
 RUN_ARGS ?=
 CHUNK_BYTES ?= 256K
@@ -19,7 +19,6 @@ endif
 endif
 
 NVSHMEM_LIBDIR ?= $(NVSHMEM_HOME)/lib
-GENCODE_FLAGS := -gencode arch=compute_$(CUDA_ARCH),code=sm_$(CUDA_ARCH)
 NVCC_FLAGS := -O3 -std=c++17 -lineinfo -rdc=true -ccbin=$(MPICXX) \
 	$(GENCODE_FLAGS) -I$(NVSHMEM_HOME)/include
 NVCC_LDFLAGS := -rdc=true -ccbin=$(MPICXX) $(GENCODE_FLAGS) \

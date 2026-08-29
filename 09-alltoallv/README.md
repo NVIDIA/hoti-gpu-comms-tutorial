@@ -142,7 +142,7 @@ Use `--blocks` to expose the first two effects. The NVSHMEM lab also exposes
 `HOTI_ALLTOALLV_NETWORK_QPS`. Change one setting at a time and keep the
 offdiagonal payload fixed.
 
-## Performance target on GB300 NVL72
+## Performance targets on GB200 and GB300 NVL72
 
 Use 75% of the hardware path SoL as the stretch target for large, balanced,
 offdiagonal traffic. Also measure the matching primitive on the same
@@ -155,33 +155,39 @@ an API or transport limit visible instead of crediting it to the collective.
 Do not apply a fixed percentage to small, sparse, or strongly skewed messages;
 launch and load-imbalance costs dominate those cases.
 
-For the Lyris placements below, the one-way hardware rates are 900
-GB/s of NVLink per GPU (half of the
-[1.8 TB/s bidirectional rate](https://docs.nvidia.com/enterprise-reference-architectures/nvl72-ai-factory/latest/network-logical-architecture.html))
-and 100 GB/s for each
-[800 Gb/s ConnectX-8 rail](https://www.nvidia.com/en-us/data-center/gb300-nvl72/).
-This gives:
+Both platforms have 1.8 TB/s bidirectional NVLink per GPU, or 900 GB/s in the
+one-way send metric used here. The selected IB rail differs: GB200 uses a
+400 Gb/s ConnectX-7 rail (50 GB/s one way), while GB300 uses an 800 Gb/s
+ConnectX-8 rail (100 GB/s one way). These system capabilities are documented
+in the [GB200 tuning guide](https://docs.nvidia.com/multi-node-nvlink-systems/multi-node-tuning-guide/overview.html),
+[GB200 rack reference](https://docs.nvidia.com/dgx-superpod/reference-architecture-scalable-infrastructure-gb200/latest/dgx-superpod-components.html),
+and [GB300 specifications](https://www.nvidia.com/en-us/data-center/gb300-nvl72/).
 
-| Placement | Large-message logical SoL | 75% target |
-| --- | ---: | ---: |
-| 8 GPUs in one NVL72 | 7.2 TB/s | 5.4 TB/s |
-| 4 GPUs in four NVL72s, one rail each | 0.4 TB/s | 0.3 TB/s |
-| 2 NVL72s x 8 GPUs, LSA + railed GIN | 3.0 TB/s | 2.25 TB/s |
+For the one-rail placements below, the corresponding aggregate logical
+ceilings are:
+
+| Placement | GB200 raw SoL | GB200 75% | GB300 raw SoL | GB300 75% |
+| --- | ---: | ---: | ---: | ---: |
+| 8 GPUs in one NVL72 | 7.2 TB/s | 5.4 TB/s | 7.2 TB/s | 5.4 TB/s |
+| 4 GPUs in four NVL72s, one rail each | 0.2 TB/s | 0.15 TB/s | 0.4 TB/s | 0.3 TB/s |
+| 2 NVL72s x 8 GPUs, LSA + railed GIN | 1.5 TB/s | 1.125 TB/s | 3.0 TB/s | 2.25 TB/s |
 
 These are aggregate logical send rates across all ranks, matching the metric
 printed by the programs; they are not per-GPU bandwidths.
 
 The IB-only row deliberately selects one HCA per rank so the NCCL and
 NVSHMEM runs have the same denominator. An NVSHMEM run that enables four
-800 Gb/s HCAs for each single-PE tray has a 1.6 TB/s aggregate raw ceiling,
-not 0.4 TB/s. Label that as a separate multi-port result.
+rails for each single-PE tray has a 0.8 TB/s GB200 or 1.6 TB/s GB300 aggregate
+raw ceiling, not the one-rail number. Label that as a separate multi-port
+result, and use the negotiated link rate rather than the adapter's marketing
+rate when a rail is degraded or absent.
 
 The hybrid number is traffic weighted. With two eight-GPU domains,
 offdiagonal AlltoAllV sends `7/15` of its bytes inside an LSA domain and
 `8/15` across the network. The network is the limiting path, so the combined
 logical SoL is `1.6 TB/s / (8/15) = 3.0 TB/s`.
 
-## Lyris reference comparison
+## GB300 Lyris reference comparison
 
 These are the best validated 256 MiB/rank offdiagonal results from the tuning
 runs. The NVSHMEM column uses the same source in all three rows. The NCCL
@@ -219,7 +225,8 @@ data path being measured.
 ## Topology test matrix
 
 Use the solved binaries to establish a baseline before changing the starters.
-On Jupiter, `CUDA_ARCH=90` is already the default.
+Chapter 9 defaults to `CUDA_ARCH=100`; use `CUDA_ARCH=90` explicitly for a
+Jupiter GH200 build.
 
 For NVLink within one LSA domain:
 

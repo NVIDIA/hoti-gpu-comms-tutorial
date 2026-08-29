@@ -115,12 +115,14 @@ GIN kernels must be compiled with headers matching the NCCL runtime library.
 This exercise uses the NCCL 2.31.2 device API:
 
 ```bash
-make NCCL_HOME=/path/to/nccl CUDA_HOME=/path/to/cuda CUDA_ARCH=90
+make NCCL_HOME=/path/to/nccl CUDA_HOME=/path/to/cuda
 ```
 
 The Makefile puts `NCCL_HOME/lib` first in `LD_LIBRARY_PATH` for its run
-targets. You can confirm the selected runtime before launching with
-`ldd ./nccl_gin_alltoallv_SOLVED | grep nccl`.
+targets. It defaults to native `sm_100` code plus `compute_100` PTX for
+GB200 and GB300. Use `CUDA_ARCHS='90 100'` for a compatible fat binary, or
+`CUDA_ARCH=90` for a GH200-only build. You can confirm the selected runtime
+before launching with `ldd ./nccl_gin_alltoallv_SOLVED | grep nccl`.
 
 ## Run over InfiniBand
 

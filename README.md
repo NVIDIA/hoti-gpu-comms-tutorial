@@ -64,10 +64,12 @@ python3 -V  # Chapter 7 only
 
 ## Jupiter launch
 
-The tutorial systems are Jupiter Booster GH200 nodes, so CUDA device code in
-the Makefile-based labs defaults to `CUDA_ARCH=90`. Request one GPU per Slurm
-task. Slurm then exposes each task's assigned GPU as CUDA device 0; the labs
-handle that convention as well as a local launch where all GPUs are visible.
+The tutorial systems are Jupiter Booster GH200 nodes, so the Makefile-based
+labs before chapter 9 default to `CUDA_ARCH=90`. Chapter 9 targets GB200 and
+GB300 NVL72 systems and instead defaults to native `sm_100` code plus
+`compute_100` PTX. Request one GPU per Slurm task. Slurm then exposes each
+task's assigned GPU as CUDA device 0; the labs handle that convention as well
+as a local launch where all GPUs are visible.
 
 ~~~bash
 salloc -p booster --nodes=1 --ntasks=2 --gpus-per-task=1

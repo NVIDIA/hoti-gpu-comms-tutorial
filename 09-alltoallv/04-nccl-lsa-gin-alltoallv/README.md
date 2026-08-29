@@ -195,7 +195,7 @@ sizes, contiguous world ranks within each LSA team, and railed GIN support. The
 setup checks that layout before launching the kernel.
 
 ```bash
-make NCCL_HOME=/path/to/nccl CUDA_HOME=/path/to/cuda CUDA_ARCH=90
+make NCCL_HOME=/path/to/nccl CUDA_HOME=/path/to/cuda
 
 make run_SOLVED NP=8 \
   LAUNCHER='srun --nodes=2 --ntasks=8 --ntasks-per-node=4 --gpus-per-task=1'
@@ -211,7 +211,10 @@ make run_SOLVED NP=16 \
   RUN_ARGS='--pattern offdiagonal --bytes-per-rank 256M --blocks 40 --threads 512 --warmup 10 --iters 50'
 ```
 
-The run target defaults to `NCCL_IB_MERGE_NICS=0` and `NCCL_CROSS_NIC=0` so
+The build defaults to native `sm_100` code plus `compute_100` PTX for GB200
+and GB300. Use `CUDA_ARCHS='90 100'` for a compatible fat binary, or
+`CUDA_ARCH=90` for a GH200-only build. The run target defaults to
+`NCCL_IB_MERGE_NICS=0` and `NCCL_CROSS_NIC=0` so
 NCCL builds corresponding GPU/NIC rails. Override those variables only when a
 system has a different validated mapping.
 

@@ -88,11 +88,14 @@ timing, and full-buffer validation are already present. Compare with
 Use NCCL 2.31.2 headers and the matching NCCL runtime library:
 
 ```bash
-make NCCL_HOME=/path/to/nccl CUDA_HOME=/path/to/cuda CUDA_ARCH=90
+make NCCL_HOME=/path/to/nccl CUDA_HOME=/path/to/cuda
 ```
 
 Keep the headers and runtime from the same NCCL build. NCCL device kernels are
-compiled against implementation details in those headers.
+compiled against implementation details in those headers. The default emits
+native `sm_100` code plus `compute_100` PTX for GB200 and GB300. Use
+`CUDA_ARCHS='90 100'` for a compatible fat binary, or `CUDA_ARCH=90` for a
+GH200-only build.
 
 ## Run on NVLink
 
