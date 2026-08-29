@@ -453,6 +453,21 @@ void launch(const alltoallv::nccl_setup::State &state,
   launch_wait_and_scatter(state, options, route_shards, epoch);
 }
 
+__global__ void synchronize_lsa_after_epoch_snapshot(ncclDevComm dev_comm) {
+#if __CUDA_ARCH__ >= 700
+  ncclLsaBarrierSession<ncclCoopCta> local_done{
+      ncclCoopCta(), dev_comm, ncclTeamTagLsa{}, blockIdx.x, false};
+  local_done.sync(ncclCoopCta(), cuda::memory_order_acq_rel);
+#endif
+}
+
+void launch_lsa_snapshot_barrier(const alltoallv::nccl_setup::State &state,
+                                 const alltoallv::Options &options) {
+  synchronize_lsa_after_epoch_snapshot<<<options.blocks, options.threads, 0,
+                                          state.stream>>>(state.dev_comm);
+  ALLTOALLV_CUDA_CHECK(cudaGetLastError());
+}
+
 void stamp_send_for_epoch_stress(const alltoallv::nccl_setup::State &state,
                                  const alltoallv::Options &options,
                                  const alltoallv::Plan &plan) {
@@ -676,6 +691,10 @@ int main(int argc, char **argv) {
         ALLTOALLV_CUDA_CHECK(cudaMemcpyAsync(
             penultimate_recv, state.recv, state.recv_bytes,
             cudaMemcpyDeviceToDevice, state.stream));
+        // A peer in this LSA team can directly write our receive buffer in
+        // the final epoch. Hold it behind a stream-ordered local barrier
+        // until every rank has captured its penultimate output.
+        launch_lsa_snapshot_barrier(state, options);
       }
     }
     ALLTOALLV_CUDA_CHECK(cudaStreamSynchronize(state.stream));

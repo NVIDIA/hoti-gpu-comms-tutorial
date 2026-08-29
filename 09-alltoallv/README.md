@@ -143,7 +143,9 @@ timed run and ordinary reuse check, it clears the receive buffer, changes every
 rank's send-buffer values before each of `N` back-to-back epochs, and validates
 both final inbox parities against their accumulated biases. It requires an
 active two-rail `--credit-pipeline` and `N >= 4`, so both inbox stages are
-reused; it adds no timing-loop events or per-epoch host synchronization.
+reused; it adds no timing-loop events or per-epoch host synchronization. A
+one-time device LSA barrier after the penultimate snapshot prevents a local
+peer's final-epoch direct store from racing that snapshot.
 
 The programs first validate one iteration, then time warm and measured
 iterations. The output separates self, same-domain, and cross-domain bytes.

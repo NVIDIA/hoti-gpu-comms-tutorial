@@ -231,11 +231,14 @@ send-buffer word and launches `N` consecutive epochs on the same stream. The
 penultimate output is preserved in a stream-ordered device snapshot, then that
 snapshot and the final output are both checked against their accumulated biases
 in active receive ranges; padding must remain untouched. This needs one local
-receive-size temporary buffer. There is intentionally no per-iteration host
-synchronization or MPI barrier; the preceding credit-path completion makes the
-source buffer safe to stamp, while stream order makes the stamp precede the
-next producer kernel. This catches a stale inbox value on either alternating
-stage that would otherwise look correct because the default payload is static.
+receive-size temporary buffer. A single device-side LSA barrier immediately
+after that snapshot holds same-domain peers out of the final epoch's direct
+stores until every local rank has captured its penultimate buffer. There is
+intentionally no per-iteration host synchronization or MPI barrier; the
+preceding credit-path completion makes the source buffer safe to stamp, while
+stream order makes the stamp precede the next producer kernel. This catches a
+stale inbox value on either alternating stage that would otherwise look correct
+because the default payload is static.
 
 The weak signal makes its own inbox shard visible before the receiver observes
 the increment; the terminal strong signal provides the corresponding guarantee
