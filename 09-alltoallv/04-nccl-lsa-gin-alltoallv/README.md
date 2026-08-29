@@ -91,9 +91,11 @@ source/destination pair gives every source domain the same spread across the
 CTA grid. The sender and receiver calculate the same CTA. The signal index is
 `blockIdx.x` within that matched context.
 
-The host requests one GIN context per CTA. The kernel uses
-`dev_comm.ginContextCount` because the actual count may differ from the host
-request and uses NCCL's default GPU-wide resource sharing:
+By default the host requests one GIN context per CTA. `--gin-contexts N` can
+request `1..--blocks` contexts instead, allowing context sharing to be swept
+without changing CTA count. The kernel uses `dev_comm.ginContextCount` because
+the actual count may differ from the host request and uses NCCL's default
+GPU-wide resource sharing:
 
 ```cpp
 ncclGin gin(dev_comm, context);
@@ -113,6 +115,10 @@ requirements.ginConnectionType = NCCL_GIN_CONNECTION_RAIL;
 
 ncclDevCommCreate(comm, &requirements, &dev_comm);
 ```
+
+`--gin-queue-depth N` sets `requirements.ginQueueDepth` (zero leaves NCCL's
+default). The setup prints the requested and created GIN resources and skips a
+run whose resources differ across ranks or cannot satisfy the CTA signal IDs.
 
 The launch is split into two kernels:
 
@@ -211,9 +217,9 @@ make run_SOLVED NP=16 \
   RUN_ARGS='--pattern offdiagonal --bytes-per-rank 256M --blocks 40 --threads 512 --warmup 10 --iters 50'
 ```
 
-The build defaults to native `sm_100` code plus `compute_100` PTX for GB200
-and GB300. Use `CUDA_ARCHS='90 100'` for a compatible fat binary, or
-`CUDA_ARCH=90` for a GH200-only build. The run target defaults to
+The build defaults to native `sm_100` (GB200) and `sm_103` (GB300) code plus
+`compute_103` PTX. Use `CUDA_ARCHS='90 100 103'` for a compatible fat binary,
+or `CUDA_ARCH=90` for a GH200-only build. The run target defaults to
 `NCCL_IB_MERGE_NICS=0` and `NCCL_CROSS_NIC=0` so
 NCCL builds corresponding GPU/NIC rails. Override those variables only when a
 system has a different validated mapping.

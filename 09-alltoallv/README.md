@@ -99,6 +99,8 @@ Every executable accepts the same workload options:
 --iters N
 --blocks N
 --threads N
+--gin-contexts N
+--gin-queue-depth N
 ```
 
 `--bytes-per-rank` is each source rank's total logical payload before aligned
@@ -106,6 +108,11 @@ gaps. `uniform` divides it across every rank, including the source itself.
 `offdiagonal` divides it only among other ranks. Use it to isolate the network
 with one GPU per direct-access domain. `skewed` is the default and gives one
 destination a much larger share. `sparse` includes zero-count pairs.
+
+`--gin-contexts` and `--gin-queue-depth` apply to the NCCL GIN and LSA +
+railed-GIN exercises. A context value of `0` (the default) requests one GIN
+context per CTA, so it preserves the original `--blocks` behavior. Set it to
+`1..--blocks` to sweep context sharing independently of CTA count.
 
 The programs first validate one iteration, then time warm and measured
 iterations. The output separates self, same-domain, and cross-domain bytes.
@@ -137,7 +144,10 @@ API:
    delayed quiet or flush protects buffer reuse. There is no quiet or flush
    after every shard.
 
-Use `--blocks` to expose the first two effects. The NVSHMEM lab also exposes
+Use `--blocks` to expose the first two effects. On the NCCL GIN paths,
+`--gin-contexts` and `--gin-queue-depth` decouple requested GIN resources from
+CTA count; the setup reports the requested and created resources and rejects a
+cross-rank mismatch. The NVSHMEM lab also exposes
 `HOTI_ALLTOALLV_CHUNK_BYTES`, `HOTI_ALLTOALLV_NETWORK_CHUNK_BYTES`, and
 `HOTI_ALLTOALLV_NETWORK_QPS`. Change one setting at a time and keep the
 offdiagonal payload fixed.
@@ -225,8 +235,8 @@ data path being measured.
 ## Topology test matrix
 
 Use the solved binaries to establish a baseline before changing the starters.
-Chapter 9 defaults to `CUDA_ARCH=100`; use `CUDA_ARCH=90` explicitly for a
-Jupiter GH200 build.
+Chapter 9 defaults to `CUDA_ARCHS='100 103'` for native GB200 and GB300
+code; use `CUDA_ARCH=90` explicitly for a Jupiter GH200 build.
 
 For NVLink within one LSA domain:
 

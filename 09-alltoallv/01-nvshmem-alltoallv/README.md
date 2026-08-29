@@ -126,10 +126,10 @@ export LD_LIBRARY_PATH="$NVSHMEM_HOME/lib:$LD_LIBRARY_PATH"
 make
 ```
 
-The Makefile builds native `sm_100` code plus `compute_100` PTX, matching the
-GB200 and GB300 NVL72 target. To build a portable teaching-machine fat binary
-with a CUDA toolkit that supports both architectures, use
-`make CUDA_ARCHS='90 100'`. For a GH200-only system, use
+The Makefile builds native `sm_100` (GB200) and `sm_103` (GB300) code plus
+`compute_103` PTX. To build a portable teaching-machine fat binary with a CUDA
+toolkit that supports all three architectures, use
+`make CUDA_ARCHS='90 100 103'`. For a GH200-only system, use
 `make CUDA_ARCH=90`. The Makefile builds the starter and `_SOLVED` reference
 and otherwise uses GNU Make like the other C/CUDA exercises.
 

@@ -30,6 +30,9 @@ struct Options {
   int iterations = 20;
   int blocks = 16;
   int threads = 256;
+  // A value of zero requests the default: one GIN context per CTA.
+  int gin_contexts = 0;
+  int gin_queue_depth = 0;
   bool help = false;
 };
 
@@ -101,7 +104,8 @@ inline void print_usage(const char *program) {
   std::printf(
       "Usage: %s [--pattern uniform|offdiagonal|skewed|sparse] "
       "[--bytes-per-rank N[K|M|G]] [--warmup N] [--iters N] "
-      "[--blocks N] [--threads N]\n",
+      "[--blocks N] [--threads N] [--gin-contexts N] "
+      "[--gin-queue-depth N]\n",
       program);
 }
 
@@ -129,6 +133,11 @@ inline Options parse_options(int argc, char **argv, int rank) {
       options.blocks = std::atoi(need_value("--blocks"));
     } else if (std::strcmp(argv[i], "--threads") == 0) {
       options.threads = std::atoi(need_value("--threads"));
+    } else if (std::strcmp(argv[i], "--gin-contexts") == 0) {
+      options.gin_contexts = std::atoi(need_value("--gin-contexts"));
+    } else if (std::strcmp(argv[i], "--gin-queue-depth") == 0) {
+      options.gin_queue_depth =
+          std::atoi(need_value("--gin-queue-depth"));
     } else if (std::strcmp(argv[i], "--help") == 0 ||
                std::strcmp(argv[i], "-h") == 0) {
       options.help = true;
@@ -147,7 +156,9 @@ inline Options parse_options(int argc, char **argv, int rank) {
       (!valid_pattern || options.bytes_per_rank < sizeof(value_type) ||
        options.warmup < 0 || options.iterations < 1 || options.blocks < 1 ||
        options.threads < 32 || options.threads > 1024 ||
-       options.threads % 32 != 0)) {
+       options.threads % 32 != 0 || options.gin_contexts < 0 ||
+       options.gin_contexts > options.blocks ||
+       options.gin_queue_depth < 0)) {
     if (rank == 0) {
       std::fprintf(stderr, "Invalid arguments\n");
       print_usage(argv[0]);
@@ -157,25 +168,30 @@ inline Options parse_options(int argc, char **argv, int rank) {
   return options;
 }
 
+inline int requested_gin_contexts(const Options &options) {
+  return options.gin_contexts == 0 ? options.blocks : options.gin_contexts;
+}
+
 inline void require_matching_collective_options(const Options &options,
                                                 int rank) {
-  int values[4] = {options.blocks, options.threads, options.warmup,
-                   options.iterations};
-  int minima[4];
-  int maxima[4];
-  mpi_check(MPI_Allreduce(values, minima, 4, MPI_INT, MPI_MIN,
+  int values[6] = {options.blocks, options.threads, options.warmup,
+                   options.iterations, options.gin_contexts,
+                   options.gin_queue_depth};
+  int minima[6];
+  int maxima[6];
+  mpi_check(MPI_Allreduce(values, minima, 6, MPI_INT, MPI_MIN,
                           MPI_COMM_WORLD),
             "MPI_Allreduce(option minimum)");
-  mpi_check(MPI_Allreduce(values, maxima, 4, MPI_INT, MPI_MAX,
+  mpi_check(MPI_Allreduce(values, maxima, 6, MPI_INT, MPI_MAX,
                           MPI_COMM_WORLD),
             "MPI_Allreduce(option maximum)");
-  for (int i = 0; i < 4; ++i) {
+  for (int i = 0; i < 6; ++i) {
     if (minima[i] == maxima[i])
       continue;
     if (rank == 0) {
       std::fprintf(stderr,
-                   "--blocks, --threads, --warmup, and --iters must match "
-                   "on every rank\n");
+                   "--blocks, --threads, --warmup, --iters, --gin-contexts, "
+                   "and --gin-queue-depth must match on every rank\n");
     }
     MPI_Abort(MPI_COMM_WORLD, 1);
   }

@@ -171,13 +171,56 @@ inline SetupResult prepare(State *state, int *argc, char ***argv,
 
   int runtime_version = 0;
   ALLTOALLV_NCCL_CHECK(ncclGetVersion(&runtime_version));
-  int supported_runtime = runtime_version >= NCCL_VERSION(2, 31, 2);
-  int all_supported = 0;
-  alltoallv::mpi_check(MPI_Allreduce(&supported_runtime, &all_supported, 1,
-                                     MPI_INT, MPI_LAND, MPI_COMM_WORLD),
-                       "MPI_Allreduce(NCCL version)");
-  if (!all_supported) {
-    print_skip(*state, "the NCCL AlltoAllV labs need NCCL 2.31.2 or newer");
+  int local_versions[2] = {NCCL_VERSION_CODE, runtime_version};
+  int minimum_versions[2] = {};
+  int maximum_versions[2] = {};
+  alltoallv::mpi_check(
+      MPI_Allreduce(local_versions, minimum_versions, 2, MPI_INT, MPI_MIN,
+                    MPI_COMM_WORLD),
+      "MPI_Allreduce(minimum NCCL versions)");
+  alltoallv::mpi_check(
+      MPI_Allreduce(local_versions, maximum_versions, 2, MPI_INT, MPI_MAX,
+                    MPI_COMM_WORLD),
+      "MPI_Allreduce(maximum NCCL versions)");
+  const bool uniform_versions =
+      minimum_versions[0] == maximum_versions[0] &&
+      minimum_versions[1] == maximum_versions[1];
+  const bool minimum_runtime = runtime_version >= NCCL_VERSION(2, 31, 2);
+  // GIN device code is not cross-version compatible.  LSA is compatible with
+  // a newer runtime, but never with a runtime older than its headers.
+  const bool compatible_runtime = backend == Backend::Lsa
+                                      ? runtime_version >= NCCL_VERSION_CODE
+                                      : runtime_version == NCCL_VERSION_CODE;
+  const int local_version_ready =
+      uniform_versions && minimum_runtime && compatible_runtime;
+  int all_version_ready = 0;
+  alltoallv::mpi_check(
+      MPI_Allreduce(&local_version_ready, &all_version_ready, 1, MPI_INT,
+                    MPI_LAND, MPI_COMM_WORLD),
+      "MPI_Allreduce(NCCL version compatibility)");
+  if (!all_version_ready) {
+    char reason[256];
+    if (!uniform_versions) {
+      std::snprintf(reason, sizeof(reason),
+                    "NCCL header/runtime versions differ across ranks "
+                    "(headers=%d..%d, runtime=%d..%d)",
+                    minimum_versions[0], maximum_versions[0],
+                    minimum_versions[1], maximum_versions[1]);
+    } else if (!minimum_runtime) {
+      std::snprintf(reason, sizeof(reason),
+                    "the NCCL AlltoAllV labs need runtime 2.31.2 or newer "
+                    "(runtime=%d)", runtime_version);
+    } else if (backend == Backend::Lsa) {
+      std::snprintf(reason, sizeof(reason),
+                    "the NCCL LSA runtime (%d) is older than its headers "
+                    "(%d)", runtime_version, NCCL_VERSION_CODE);
+    } else {
+      std::snprintf(reason, sizeof(reason),
+                    "GIN requires matching NCCL headers and runtime "
+                    "(headers=%d, runtime=%d)", NCCL_VERSION_CODE,
+                    runtime_version);
+    }
+    print_skip(*state, reason);
     return SetupResult::Skipped;
   }
 
@@ -337,19 +380,23 @@ inline SetupResult prepare(State *state, int *argc, char ***argv,
 
   ncclDevCommRequirements requirements =
       NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
+  const int requested_gin_contexts =
+      alltoallv::requested_gin_contexts(*options);
   if (backend == Backend::Lsa) {
     requirements.lsaBarrierCount = options->blocks;
   } else if (backend == Backend::Gin) {
-    requirements.ginContextCount = options->blocks;
+    requirements.ginContextCount = requested_gin_contexts;
     requirements.worldGinBarrierCount = options->blocks;
     requirements.ginSignalCount = options->blocks;
+    requirements.ginQueueDepth = options->gin_queue_depth;
     requirements.ginConnectionType = NCCL_GIN_CONNECTION_FULL;
     requirements.ginStrongSignalsRequired = false;
     requirements.ginVaSignalsRequired = false;
   } else {
-    requirements.ginContextCount = options->blocks;
+    requirements.ginContextCount = requested_gin_contexts;
     requirements.barrierCount = options->blocks;
     requirements.ginSignalCount = options->blocks;
+    requirements.ginQueueDepth = options->gin_queue_depth;
     requirements.ginConnectionType = NCCL_GIN_CONNECTION_RAIL;
     requirements.ginStrongSignalsRequired = false;
     requirements.ginVaSignalsRequired = false;
@@ -357,6 +404,45 @@ inline SetupResult prepare(State *state, int *argc, char ***argv,
   ALLTOALLV_NCCL_CHECK(
       ncclDevCommCreate(state->comm, &requirements, &state->dev_comm));
   state->dev_comm_created = true;
+  if (backend != Backend::Lsa) {
+    int local_resources[2] = {
+        static_cast<int>(state->dev_comm.ginContextCount),
+        state->dev_comm.ginSignalCount};
+    int minimum_resources[2] = {};
+    int maximum_resources[2] = {};
+    alltoallv::mpi_check(
+        MPI_Allreduce(local_resources, minimum_resources, 2, MPI_INT,
+                      MPI_MIN, MPI_COMM_WORLD),
+        "MPI_Allreduce(minimum GIN resources)");
+    alltoallv::mpi_check(
+        MPI_Allreduce(local_resources, maximum_resources, 2, MPI_INT,
+                      MPI_MAX, MPI_COMM_WORLD),
+        "MPI_Allreduce(maximum GIN resources)");
+    const bool uniform_resources =
+        minimum_resources[0] == maximum_resources[0] &&
+        minimum_resources[1] == maximum_resources[1];
+    const bool resources_sufficient =
+        local_resources[0] > 0 && local_resources[1] >= options->blocks;
+    const int local_resources_ready =
+        uniform_resources && resources_sufficient;
+    int all_resources_ready = 0;
+    alltoallv::mpi_check(
+        MPI_Allreduce(&local_resources_ready, &all_resources_ready, 1,
+                      MPI_INT, MPI_LAND, MPI_COMM_WORLD),
+        "MPI_Allreduce(GIN resource compatibility)");
+    if (!all_resources_ready) {
+      char reason[256];
+      std::snprintf(reason, sizeof(reason),
+                    "GIN resources are unsuitable or differ across ranks "
+                    "(contexts=%d..%d, signals=%d..%d; need nonzero "
+                    "contexts and at least %d signals)",
+                    minimum_resources[0], maximum_resources[0],
+                    minimum_resources[1], maximum_resources[1],
+                    options->blocks);
+      print_skip(*state, reason);
+      return SetupResult::Skipped;
+    }
+  }
   alltoallv::mpi_check(MPI_Barrier(MPI_COMM_WORLD), "MPI_Barrier(setup)");
 
   if (state->rank == 0) {
@@ -369,9 +455,12 @@ inline SetupResult prepare(State *state, int *argc, char ***argv,
         static_cast<int>(properties.ginType),
         static_cast<int>(properties.railedGinType));
     if (backend != Backend::Lsa) {
-      std::printf("NCCL GIN contexts: requested=%d, created=%u\n",
-                  requirements.ginContextCount,
-                  state->dev_comm.ginContextCount);
+      std::printf(
+          "NCCL GIN resources: contexts requested=%d, created=%u; "
+          "signals requested=%d, created=%d; queue depth=%d\n",
+          requirements.ginContextCount, state->dev_comm.ginContextCount,
+          requirements.ginSignalCount, state->dev_comm.ginSignalCount,
+          requirements.ginQueueDepth);
     }
   }
   return SetupResult::Ready;

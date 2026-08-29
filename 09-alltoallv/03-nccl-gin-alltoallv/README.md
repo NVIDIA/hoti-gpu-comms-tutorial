@@ -31,14 +31,17 @@ non-empty non-self shard is one GIN put. All CTA threads copy a shard of the
 self segment directly between the local send and receive buffers; self traffic
 does not consume a GIN route.
 
-The host requests one GIN context per CTA. NCCL may create a different number,
-for example by rounding the request up across GIN connections. The kernel
-assigns CTAs to the created contexts round-robin. Each CTA uses `blockIdx.x` as
-its signal index. Its route identifies the one source from which it may receive
-a shard, so the incoming count tells it whether to wait for zero or one signal.
+By default the host requests one GIN context per CTA. NCCL may create a
+different number, for example by rounding the request up across GIN
+connections. `--gin-contexts N` can request `1..--blocks` contexts instead,
+so context sharing can be swept independently of CTA count. The kernel assigns
+CTAs to the created contexts round-robin. Each CTA uses `blockIdx.x` as its
+signal index. Its route identifies the one source from which it may receive a
+shard, so the incoming count tells it whether to wait for zero or one signal.
 `--blocks` must be at least the number of non-self routes, or `ranks - 1`.
-More blocks create more route shards and request more GIN contexts; they are
-not simply an occupancy knob.
+More blocks create more route shards and signal/barrier resources; they are not
+simply an occupancy knob. `--gin-queue-depth N` sets the requested GIN queue
+depth (zero leaves NCCL's default).
 
 The synchronization sequence in each CTA is:
 
@@ -119,10 +122,11 @@ make NCCL_HOME=/path/to/nccl CUDA_HOME=/path/to/cuda
 ```
 
 The Makefile puts `NCCL_HOME/lib` first in `LD_LIBRARY_PATH` for its run
-targets. It defaults to native `sm_100` code plus `compute_100` PTX for
-GB200 and GB300. Use `CUDA_ARCHS='90 100'` for a compatible fat binary, or
-`CUDA_ARCH=90` for a GH200-only build. You can confirm the selected runtime
-before launching with `ldd ./nccl_gin_alltoallv_SOLVED | grep nccl`.
+targets. It defaults to native `sm_100` (GB200) and `sm_103` (GB300) code plus
+`compute_103` PTX. Use `CUDA_ARCHS='90 100 103'` for a compatible fat binary,
+or `CUDA_ARCH=90` for a GH200-only build. The setup requires exact
+header/runtime agreement for GIN, so confirm the selected runtime before
+launching with `ldd ./nccl_gin_alltoallv_SOLVED | grep nccl`.
 
 ## Run over InfiniBand
 
