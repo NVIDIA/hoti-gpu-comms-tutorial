@@ -126,7 +126,7 @@ The launch is split into two kernels:
    messages with LSA pointers, and issues the cross-domain shard puts.
 2. `wait_and_scatter` counts the non-empty incoming shards assigned to each
    CTA, waits once for all of them, copies them to the final local GPUs,
-   flushes the same GIN context's outgoing puts, and enters the final world
+   completes the same GIN context's outgoing puts, and enters the final world
    barrier.
 
 Keeping the sends in a kernel with no remote waits avoids filling the GPU with
@@ -146,13 +146,23 @@ This lets a CTA post several independent GIN work requests without changing
 the inbox layout, signal IDs, or reuse protocol. Start with `N=1`; tune it
 only after the default has passed correctness checks on the target topology.
 
+`--async-flush` is a deliberately narrow two-rail experiment. Each CTA starts
+a peer-scoped `gin.flushAsync` for its one remote rail peer before waiting for
+incoming signals, scatters the received shards, then calls `gin.wait` on that
+request before the final barrier. This overlaps source-completion polling with
+the receive side while preserving the send-buffer reuse guarantee. Other rail
+team shapes, and backends without a peer async-completion request, fall back to
+the usual synchronous `gin.flush`, because one async request covers only one
+peer. The validated GB300 configuration reports `railed GIN=GDAKI`.
+
 The weak signal makes its own inbox shard visible before the receiver observes
 the increment. It does not make the sender's source range safe to reuse;
-`gin.flush` provides that local completion guarantee. The flush is delayed
-until the second kernel so outgoing puts can remain in flight while the CTA
-waits for and scatters incoming data. The final world barrier runs after every
-CTA has flushed its outgoing context and completed its LSA scatter. The next
-launch can then reuse the send buffer and inbox slots.
+`gin.flush` (or the matching `gin.wait` after `--async-flush`) provides that
+local completion guarantee. The completion work is delayed until the second
+kernel so outgoing puts can remain in flight while the CTA waits for and
+scatters incoming data. The final world barrier runs after every CTA has
+completed its outgoing context and LSA scatter. The next launch can then reuse
+the send buffer and inbox slots.
 
 The main device APIs are:
 
@@ -249,6 +259,11 @@ make run_SOLVED NP=16 \
   RUN_ARGS='--pattern offdiagonal --bytes-per-rank 256M --blocks 40 --threads 512 --warmup 10 --iters 50 --profile-phases'
 ```
 
+On a topology with exactly two rail ranks, compare the candidate with the
+same normal (non-profiled) workload by adding `--async-flush`. Keep the default
+synchronous mode as the baseline; a profile is for locating tail work, not
+for reporting throughput.
+
 The additional line reports `send + local delivery` separately from `wait +
 scatter + flush`. Use it to choose the next algorithmic experiment, then turn
 the flag off for the throughput number because the optional per-iteration CUDA
@@ -259,6 +274,8 @@ into plan/signal wait, LSA scatter, and GIN flush/barrier. It chooses the
 slowest CTA per iteration and scales those device-clock ratios to the
 CUDA-event completion time, so use it to identify the next experiment rather
 than as a standalone throughput number.
+With `--async-flush`, the trace labels the asynchronous flush start with the
+first phase and its later completion wait with the final phase.
 
 CTA count affects both the LSA copy and the requested GIN-context count. Start
 with the default for small messages. On the Lyris placement above, start

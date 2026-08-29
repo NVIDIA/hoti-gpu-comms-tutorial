@@ -121,6 +121,12 @@ kernel (`wait_and_scatter`, including scatter and flush). It is a diagnostic
 run, not a headline-performance run: it records three CUDA events per
 iteration so the two sequential stages can be tuned independently.
 
+The LSA + railed-GIN exercise additionally accepts `--network-issuers N` and
+`--async-flush`. The latter is a two-rail source-completion overlap experiment:
+it begins the peer-specific flush before receive work, waits for its request
+before the final reuse barrier, and otherwise falls back to a synchronous
+flush. The other exercises reject these hybrid-only controls.
+
 The programs first validate one iteration, then time warm and measured
 iterations. The output separates self, same-domain, and cross-domain bytes.
 NCCL uses its LSA team as the domain. NVSHMEM uses the set of PEs for which

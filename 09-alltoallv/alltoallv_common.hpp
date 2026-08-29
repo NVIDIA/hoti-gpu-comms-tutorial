@@ -35,6 +35,8 @@ struct Options {
   int gin_queue_depth = 0;
   // Number of threads that issue slices of one assigned hybrid GIN shard.
   int network_issuers = 1;
+  // Overlap a two-rail GIN source-completion flush with receive work.
+  bool async_flush = false;
   bool profile_phases = false;
   bool help = false;
 };
@@ -104,17 +106,19 @@ inline std::uint64_t parse_bytes(const char *text) {
 }
 
 inline void print_usage(const char *program,
-                        bool allow_network_issuers = false) {
+                        bool allow_hybrid_options = false) {
   std::printf(
       "Usage: %s [--pattern uniform|offdiagonal|skewed|sparse] "
       "[--bytes-per-rank N[K|M|G]] [--warmup N] [--iters N] "
       "[--blocks N] [--threads N] [--gin-contexts N] "
       "[--gin-queue-depth N] %s[--profile-phases]\n",
-      program, allow_network_issuers ? "[--network-issuers N] " : "");
+      program, allow_hybrid_options
+                   ? "[--network-issuers N] [--async-flush] "
+                   : "");
 }
 
 inline Options parse_options(int argc, char **argv, int rank,
-                             bool allow_network_issuers = false) {
+                             bool allow_hybrid_options = false) {
   Options options;
   for (int i = 1; i < argc; ++i) {
     auto need_value = [&](const char *name) -> const char * {
@@ -143,10 +147,13 @@ inline Options parse_options(int argc, char **argv, int rank,
     } else if (std::strcmp(argv[i], "--gin-queue-depth") == 0) {
       options.gin_queue_depth =
           std::atoi(need_value("--gin-queue-depth"));
-    } else if (allow_network_issuers &&
+    } else if (allow_hybrid_options &&
                std::strcmp(argv[i], "--network-issuers") == 0) {
       options.network_issuers =
           std::atoi(need_value("--network-issuers"));
+    } else if (allow_hybrid_options &&
+               std::strcmp(argv[i], "--async-flush") == 0) {
+      options.async_flush = true;
     } else if (std::strcmp(argv[i], "--profile-phases") == 0) {
       options.profile_phases = true;
     } else if (std::strcmp(argv[i], "--help") == 0 ||
@@ -173,7 +180,7 @@ inline Options parse_options(int argc, char **argv, int rank,
        options.network_issuers > options.threads)) {
     if (rank == 0) {
       std::fprintf(stderr, "Invalid arguments\n");
-      print_usage(argv[0], allow_network_issuers);
+      print_usage(argv[0], allow_hybrid_options);
     }
     MPI_Abort(MPI_COMM_WORLD, 1);
   }
@@ -186,29 +193,30 @@ inline int requested_gin_contexts(const Options &options) {
 
 inline void require_matching_collective_options(const Options &options,
                                                 int rank) {
-  int values[8] = {options.blocks,
+  int values[9] = {options.blocks,
                    options.threads,
                    options.warmup,
                    options.iterations,
                    options.gin_contexts,
                    options.gin_queue_depth,
                    options.network_issuers,
+                   static_cast<int>(options.async_flush),
                    static_cast<int>(options.profile_phases)};
-  int minima[8];
-  int maxima[8];
-  mpi_check(MPI_Allreduce(values, minima, 8, MPI_INT, MPI_MIN,
+  int minima[9];
+  int maxima[9];
+  mpi_check(MPI_Allreduce(values, minima, 9, MPI_INT, MPI_MIN,
                           MPI_COMM_WORLD),
             "MPI_Allreduce(option minimum)");
-  mpi_check(MPI_Allreduce(values, maxima, 8, MPI_INT, MPI_MAX,
+  mpi_check(MPI_Allreduce(values, maxima, 9, MPI_INT, MPI_MAX,
                           MPI_COMM_WORLD),
             "MPI_Allreduce(option maximum)");
-  for (int i = 0; i < 8; ++i) {
+  for (int i = 0; i < 9; ++i) {
     if (minima[i] == maxima[i])
       continue;
     if (rank == 0) {
       std::fprintf(stderr,
                    "--blocks, --threads, --warmup, --iters, --gin-contexts, "
-                   "--gin-queue-depth, --network-issuers, and "
+                   "--gin-queue-depth, --network-issuers, --async-flush, and "
                    "--profile-phases must match on "
                    "every rank\n");
     }

@@ -52,6 +52,7 @@ struct State {
   cudaStream_t stream = nullptr;
   ncclTeam_t lsa_team{};
   ncclTeam_t rail_team{};
+  ncclGinType_t railed_gin_type = NCCL_GIN_TYPE_NONE;
 
   void *send = nullptr;
   void *recv = nullptr;
@@ -94,6 +95,21 @@ inline const char *gin_type_name(ncclGinType_t type) {
     return "EFA GDA";
   default:
     return "unknown";
+  }
+}
+
+inline bool supports_two_rail_async_flush(const State &state) {
+  if (state.rail_team.nRanks != 2)
+    return false;
+  // NCCL 2.31.2's EFA GDA async request and wait are no-ops. Restrict the
+  // teaching candidate to backends with a real peer-completion request.
+  switch (state.railed_gin_type) {
+  case NCCL_GIN_TYPE_PROXY:
+  case NCCL_GIN_TYPE_GDAKI:
+  case NCCL_GIN_TYPE_GPI:
+    return true;
+  default:
+    return false;
   }
 }
 
@@ -148,12 +164,12 @@ inline SetupResult prepare(State *state, int *argc, char ***argv,
   alltoallv::mpi_check(MPI_Comm_size(MPI_COMM_WORLD, &state->size),
                        "MPI_Comm_size");
 
-  const bool allow_network_issuers = backend == Backend::HybridRail;
+  const bool allow_hybrid_options = backend == Backend::HybridRail;
   *options = alltoallv::parse_options(*argc, *argv, state->rank,
-                                      allow_network_issuers);
+                                      allow_hybrid_options);
   if (options->help) {
     if (state->rank == 0)
-      alltoallv::print_usage((*argv)[0], allow_network_issuers);
+      alltoallv::print_usage((*argv)[0], allow_hybrid_options);
     return SetupResult::Skipped;
   }
   alltoallv::require_matching_collective_options(*options, state->rank);
@@ -257,6 +273,7 @@ inline SetupResult prepare(State *state, int *argc, char ***argv,
       ncclCommQueryProperties(state->comm, &properties));
   state->lsa_team = ncclTeamLsa(state->comm);
   state->rail_team = ncclTeamRail(state->comm);
+  state->railed_gin_type = properties.railedGinType;
   const int lsa_root =
       ncclTeamRankToWorld(state->comm, state->lsa_team, 0);
   alltoallv::classify_placement(plan, lsa_root, state->lsa_team.rank,

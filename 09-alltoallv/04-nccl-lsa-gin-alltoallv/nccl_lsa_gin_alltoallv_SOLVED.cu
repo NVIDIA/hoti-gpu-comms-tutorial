@@ -210,7 +210,7 @@ struct CompletionWarpTrace {
 
 constexpr int kWarpThreads = 32;
 
-template <bool kProfileCycles>
+template <bool kProfileCycles, bool kAsyncFlush>
 __global__ void wait_and_scatter(
     ncclDevComm dev_comm, ncclWindow_t recv_window,
     ncclWindow_t plan_window, ncclWindow_t inbox_window,
@@ -232,9 +232,13 @@ __global__ void wait_and_scatter(
 
   const int task_count = rail.nRanks * lsa.nRanks;
   __shared__ std::uint64_t expected;
+  __shared__ ncclGinRequest_t flush_request;
   if constexpr (kProfileCycles) {
     if (threadIdx.x == 0)
       block_traces[blockIdx.x].wait_begin = clock64();
+  }
+  if constexpr (kAsyncFlush) {
+    gin.flushAsync(rail, 1 - rail.rank, &flush_request, ncclCoopCta());
   }
   if (threadIdx.x == 0) {
     expected = 0;
@@ -292,7 +296,11 @@ __global__ void wait_and_scatter(
           .scatter_end = clock64();
     }
   }
-  gin.flush(ncclCoopCta());
+  if constexpr (kAsyncFlush) {
+    gin.wait(flush_request, ncclCoopCta());
+  } else {
+    gin.flush(ncclCoopCta());
+  }
 
   barrier.sync(ncclCoopCta(), cuda::memory_order_acq_rel,
                ncclGinFenceLevel::None);
@@ -314,15 +322,32 @@ void launch_send_and_deliver_local(const alltoallv::nccl_setup::State &state,
   ALLTOALLV_CUDA_CHECK(cudaGetLastError());
 }
 
-void launch_wait_and_scatter(const alltoallv::nccl_setup::State &state,
-                             const alltoallv::Options &options,
-                             int route_shards, std::uint64_t epoch) {
-  wait_and_scatter<false><<<options.blocks, options.threads, 0, state.stream>>>(
+template <bool kProfileCycles, bool kAsyncFlush>
+void launch_wait_and_scatter_impl(
+    const alltoallv::nccl_setup::State &state,
+    const alltoallv::Options &options, int route_shards,
+    std::uint64_t epoch, CompletionBlockTrace *block_traces,
+    CompletionWarpTrace *warp_traces) {
+  wait_and_scatter<kProfileCycles, kAsyncFlush>
+      <<<options.blocks, options.threads, 0, state.stream>>>(
       state.dev_comm, state.recv_window, state.plan_window,
       state.inbox_window, state.hybrid_slot_bytes,
       state.hybrid_domain_bytes, route_shards, options.network_issuers,
-      epoch, nullptr, nullptr);
+      epoch, block_traces, warp_traces);
   ALLTOALLV_CUDA_CHECK(cudaGetLastError());
+}
+
+void launch_wait_and_scatter(const alltoallv::nccl_setup::State &state,
+                             const alltoallv::Options &options,
+                             int route_shards, std::uint64_t epoch) {
+  if (options.async_flush &&
+      alltoallv::nccl_setup::supports_two_rail_async_flush(state)) {
+    launch_wait_and_scatter_impl<false, true>(
+        state, options, route_shards, epoch, nullptr, nullptr);
+  } else {
+    launch_wait_and_scatter_impl<false, false>(
+        state, options, route_shards, epoch, nullptr, nullptr);
+  }
 }
 
 void launch_profiled_wait_and_scatter(
@@ -330,12 +355,14 @@ void launch_profiled_wait_and_scatter(
     const alltoallv::Options &options, int route_shards,
     std::uint64_t epoch, CompletionBlockTrace *block_traces,
     CompletionWarpTrace *warp_traces) {
-  wait_and_scatter<true><<<options.blocks, options.threads, 0, state.stream>>>(
-      state.dev_comm, state.recv_window, state.plan_window,
-      state.inbox_window, state.hybrid_slot_bytes,
-      state.hybrid_domain_bytes, route_shards, options.network_issuers,
-      epoch, block_traces, warp_traces);
-  ALLTOALLV_CUDA_CHECK(cudaGetLastError());
+  if (options.async_flush &&
+      alltoallv::nccl_setup::supports_two_rail_async_flush(state)) {
+    launch_wait_and_scatter_impl<true, true>(
+        state, options, route_shards, epoch, block_traces, warp_traces);
+  } else {
+    launch_wait_and_scatter_impl<true, false>(
+        state, options, route_shards, epoch, block_traces, warp_traces);
+  }
 }
 
 void launch(const alltoallv::nccl_setup::State &state,
@@ -470,9 +497,10 @@ PhaseTimes profile_iterations(const alltoallv::nccl_setup::State &state,
   return result;
 }
 
-void report_completion_trace_timing(const alltoallv::Options &options,
-                                    const char *implementation,
-                                    const PhaseTimes &phases) {
+void report_completion_trace_timing(
+    const alltoallv::nccl_setup::State &state,
+    const alltoallv::Options &options, const char *implementation,
+    const PhaseTimes &phases) {
   if (!options.profile_phases)
     return;
   int rank = 0;
@@ -506,14 +534,22 @@ void report_completion_trace_timing(const alltoallv::Options &options,
       total_ms == 0.0f ? 0.0f : 100.0f * critical_phase_ms[1] / total_ms;
   const float flush_fraction =
       total_ms == 0.0f ? 0.0f : 100.0f * critical_phase_ms[2] / total_ms;
+  const bool use_async_flush =
+      options.async_flush &&
+      alltoallv::nccl_setup::supports_two_rail_async_flush(state);
+  const char *wait_label =
+      use_async_flush ? "async flush start + plan + signal wait"
+                      : "plan + signal wait";
+  const char *flush_label =
+      use_async_flush ? "GIN flush wait + barrier" : "GIN flush + barrier";
   std::printf(
-      "%s completion trace: %.3f ms/iteration plan + signal wait (%.1f%%), "
-      "%.3f ms/iteration LSA scatter (%.1f%%), %.3f ms/iteration GIN "
-      "flush + barrier (%.1f%%; critical CTA, CUDA-event-scaled)\n",
-      implementation, critical_phase_ms[0] / options.iterations,
+      "%s completion trace: %.3f ms/iteration %s (%.1f%%), %.3f "
+      "ms/iteration LSA scatter (%.1f%%), %.3f ms/iteration %s "
+      "(%.1f%%; critical CTA, CUDA-event-scaled)\n",
+      implementation, critical_phase_ms[0] / options.iterations, wait_label,
       plan_fraction, critical_phase_ms[1] / options.iterations,
       scatter_fraction, critical_phase_ms[2] / options.iterations,
-      flush_fraction);
+      flush_label, flush_fraction);
 }
 
 int choose_route_shards(const alltoallv::nccl_setup::State &state,
@@ -562,11 +598,20 @@ int main(int argc, char **argv) {
 
   alltoallv::print_plan(plan, options, "NCCL LSA + railed GIN AlltoAllV");
   const int route_shards = choose_route_shards(state, options, plan);
+  const bool use_async_flush =
+      options.async_flush &&
+      alltoallv::nccl_setup::supports_two_rail_async_flush(state);
   if (state.rank == 0) {
     std::printf(
         "NCCL hybrid routing: %d shard(s) per remote route, %d issuer(s) "
-        "per shard\n",
-        route_shards, options.network_issuers);
+        "per shard, %s source-completion flush\n",
+        route_shards, options.network_issuers,
+        use_async_flush ? "async" : "synchronous");
+    if (options.async_flush && !use_async_flush) {
+      std::printf(
+          "NCCL hybrid routing: --async-flush needs two rail ranks and a "
+          "backend with peer async completion; using the synchronous flush\n");
+    }
   }
   std::uint64_t epoch = 1;
   launch(state, options, route_shards, epoch);
@@ -610,7 +655,7 @@ int main(int argc, char **argv) {
         options, "NCCL LSA + railed GIN AlltoAllV",
         phases.send_and_deliver_ms, phases.wait_and_scatter_ms);
     report_completion_trace_timing(
-        options, "NCCL LSA + railed GIN AlltoAllV", phases);
+        state, options, "NCCL LSA + railed GIN AlltoAllV", phases);
   }
 
   ALLTOALLV_CUDA_CHECK(

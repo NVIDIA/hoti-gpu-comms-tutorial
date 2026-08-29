@@ -200,6 +200,7 @@ __global__ void send_and_deliver_local(
 #endif
 }
 
+template <bool kAsyncFlush>
 __global__ void wait_and_scatter(
     ncclDevComm dev_comm, ncclWindow_t recv_window,
     ncclWindow_t plan_window, ncclWindow_t inbox_window,
@@ -220,6 +221,13 @@ __global__ void wait_and_scatter(
 
   const int task_count = rail.nRanks * lsa.nRanks;
   __shared__ std::uint64_t expected;
+  __shared__ ncclGinRequest_t flush_request;
+  if constexpr (kAsyncFlush) {
+    // On two rails the prior sender kernel only issued GIN puts to the one
+    // other rail rank. Start source-completion polling while this CTA waits
+    // for and scatters its incoming shards; wait for it before buffer reuse.
+    gin.flushAsync(rail, 1 - rail.rank, &flush_request, ncclCoopCta());
+  }
   if (threadIdx.x == 0) {
     expected = 0;
     for (int task = 0; task < task_count; ++task) {
@@ -258,7 +266,11 @@ __global__ void wait_and_scatter(
   (void)expected;
   (void)epoch;
 
-  gin.flush(ncclCoopCta());
+  if constexpr (kAsyncFlush) {
+    gin.wait(flush_request, ncclCoopCta());
+  } else {
+    gin.flush(ncclCoopCta());
+  }
   barrier.sync(ncclCoopCta(), cuda::memory_order_acq_rel,
                ncclGinFenceLevel::None);
 #endif
@@ -275,15 +287,31 @@ void launch_send_and_deliver_local(const alltoallv::nccl_setup::State &state,
   ALLTOALLV_CUDA_CHECK(cudaGetLastError());
 }
 
-void launch_wait_and_scatter(const alltoallv::nccl_setup::State &state,
-                             const alltoallv::Options &options,
-                             int route_shards, std::uint64_t epoch) {
-  wait_and_scatter<<<options.blocks, options.threads, 0, state.stream>>>(
+template <bool kAsyncFlush>
+void launch_wait_and_scatter_impl(
+    const alltoallv::nccl_setup::State &state,
+    const alltoallv::Options &options, int route_shards,
+    std::uint64_t epoch) {
+  wait_and_scatter<kAsyncFlush>
+      <<<options.blocks, options.threads, 0, state.stream>>>(
       state.dev_comm, state.recv_window, state.plan_window,
       state.inbox_window, state.hybrid_slot_bytes,
       state.hybrid_domain_bytes, route_shards, options.network_issuers,
       epoch);
   ALLTOALLV_CUDA_CHECK(cudaGetLastError());
+}
+
+void launch_wait_and_scatter(const alltoallv::nccl_setup::State &state,
+                             const alltoallv::Options &options,
+                             int route_shards, std::uint64_t epoch) {
+  // flushAsync is peer-scoped. This exercise uses one request only, so retain
+  // the synchronous all-peer flush when the rail team has another shape.
+  if (options.async_flush &&
+      alltoallv::nccl_setup::supports_two_rail_async_flush(state)) {
+    launch_wait_and_scatter_impl<true>(state, options, route_shards, epoch);
+  } else {
+    launch_wait_and_scatter_impl<false>(state, options, route_shards, epoch);
+  }
 }
 
 void launch(const alltoallv::nccl_setup::State &state,
@@ -381,11 +409,20 @@ int main(int argc, char **argv) {
 
   alltoallv::print_plan(plan, options, "NCCL LSA + railed GIN AlltoAllV");
   const int route_shards = choose_route_shards(state, options, plan);
+  const bool use_async_flush =
+      options.async_flush &&
+      alltoallv::nccl_setup::supports_two_rail_async_flush(state);
   if (state.rank == 0) {
     std::printf(
         "NCCL hybrid routing: %d shard(s) per remote route, %d issuer(s) "
-        "per shard\n",
-        route_shards, options.network_issuers);
+        "per shard, %s source-completion flush\n",
+        route_shards, options.network_issuers,
+        use_async_flush ? "async" : "synchronous");
+    if (options.async_flush && !use_async_flush) {
+      std::printf(
+          "NCCL hybrid routing: --async-flush needs two rail ranks and a "
+          "backend with peer async completion; using the synchronous flush\n");
+    }
   }
   std::uint64_t epoch = 1;
   launch(state, options, route_shards, epoch);
