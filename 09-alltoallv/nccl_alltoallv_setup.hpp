@@ -558,4 +558,18 @@ inline int copy_and_validate(State *state, const Plan &plan,
   return alltoallv::validate(plan, observed, implementation);
 }
 
+// The reuse validation deliberately clears the receive buffer so a missing
+// write cannot be hidden by data from a prior launch. Direct LSA writes come
+// from peer streams, so all ranks must finish that clear before any rank
+// starts the next collective.
+inline void clear_recv_for_reuse(State *state) {
+  alltoallv::mpi_check(MPI_Barrier(MPI_COMM_WORLD),
+                       "MPI_Barrier(reuse clear begin)");
+  ALLTOALLV_CUDA_CHECK(
+      cudaMemsetAsync(state->recv, 0xa5, state->recv_bytes, state->stream));
+  ALLTOALLV_CUDA_CHECK(cudaStreamSynchronize(state->stream));
+  alltoallv::mpi_check(MPI_Barrier(MPI_COMM_WORLD),
+                       "MPI_Barrier(reuse clear complete)");
+}
+
 } // namespace alltoallv::nccl_setup
