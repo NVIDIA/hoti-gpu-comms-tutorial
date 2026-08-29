@@ -72,6 +72,7 @@ __device__ void scatter_assigned_shards(
     ncclDevComm dev_comm, ncclWindow_t recv_window,
     ncclWindow_t plan_window, ncclWindow_t inbox_window,
     std::size_t slot_bytes, std::size_t domain_bytes,
+    std::size_t stage_bytes, int stage,
     int route_shards) {
   const ncclTeam lsa = ncclTeamLsa(dev_comm);
   const ncclTeam rail = ncclTeamRail(dev_comm);
@@ -100,7 +101,8 @@ __device__ void scatter_assigned_shards(
       const value_type *source_values = static_cast<const value_type *>(
           ncclGetLocalPointer(
               inbox_window,
-              source_domain * domain_bytes + destination_local * slot_bytes +
+              stage * stage_bytes + source_domain * domain_bytes +
+                  destination_local * slot_bytes +
                   offset * sizeof(value_type)));
       value_type *destination = static_cast<value_type *>(ncclGetLsaPointer(
           recv_window,
@@ -112,29 +114,76 @@ __device__ void scatter_assigned_shards(
   }
 }
 
+template <bool kCreditPipeline>
 __global__ void send_and_deliver_local(
     ncclDevComm dev_comm, ncclWindow_t send_window,
     ncclWindow_t recv_window, ncclWindow_t plan_window,
     ncclWindow_t inbox_window, std::size_t slot_bytes,
-    std::size_t domain_bytes, int route_shards, int network_issuers) {
+    std::size_t domain_bytes, std::size_t stage_bytes, int route_shards,
+    int network_issuers, std::uint64_t epoch) {
 #if __CUDA_ARCH__ >= 700
   const int context_count =
       min(static_cast<int>(gridDim.x),
           static_cast<int>(dev_comm.ginContextCount));
   const int context = static_cast<int>(blockIdx.x) % context_count;
-  const ncclGinSignal_t signal =
-      static_cast<ncclGinSignal_t>(blockIdx.x);
+  const int stage =
+      kCreditPipeline ? static_cast<int>((epoch - 1) & 1) : 0;
+  const ncclGinSignal_t data_signal = static_cast<ncclGinSignal_t>(
+      kCreditPipeline ? stage * static_cast<int>(gridDim.x) + blockIdx.x
+                      : blockIdx.x);
   ncclGin gin{dev_comm, context};
-  ncclBarrierSession<ncclCoopCta> barrier{
-      ncclCoopCta(), ncclTeamTagWorld(), gin, blockIdx.x};
-  barrier.sync(ncclCoopCta(), cuda::memory_order_acquire,
-               ncclGinFenceLevel::None);
 
   const ncclTeam lsa = ncclTeamLsa(dev_comm);
   const ncclTeam rail = ncclTeamRail(dev_comm);
   const int domain_first_rank = dev_comm.rank - lsa.rank;
   const DevicePlanEntry *plan = static_cast<const DevicePlanEntry *>(
       ncclGetLocalPointer(plan_window, 0));
+
+  if constexpr (kCreditPipeline) {
+    const ncclGinSignal_t credit_signal = static_cast<ncclGinSignal_t>(
+        (2 + stage) * static_cast<int>(gridDim.x) + blockIdx.x);
+    __shared__ std::uint64_t outgoing_routes;
+    if (threadIdx.x == 0) {
+      outgoing_routes = 0;
+      const int task_count = rail.nRanks * lsa.nRanks;
+      for (int task = 0; task < task_count; ++task) {
+        const int destination_domain = task / lsa.nRanks;
+        const int destination_local = task % lsa.nRanks;
+        if (destination_domain == rail.rank)
+          continue;
+        const int ingress_rank =
+            ncclTeamRankToWorld(dev_comm, rail, destination_domain);
+        const int destination = ingress_rank - lsa.rank + destination_local;
+        const DevicePlanEntry entry = plan[destination];
+        for (int shard = 0; shard < route_shards; ++shard) {
+          if (route_shard_block(
+                  rail.rank, destination_domain, destination_local,
+                  rail.nRanks, lsa.nRanks, shard, route_shards,
+                  gridDim.x) != blockIdx.x)
+            continue;
+          std::uint64_t offset = 0;
+          std::uint64_t count = 0;
+          shard_slice(entry.send_count, shard, route_shards, &offset,
+                      &count);
+          outgoing_routes += count != 0;
+        }
+      }
+    }
+    __syncthreads();
+    if (epoch > 2 && outgoing_routes != 0) {
+      const std::uint64_t completed_rounds = (epoch - 1) / 2;
+      gin.waitSignal(ncclCoopCta(), credit_signal,
+                     completed_rounds * outgoing_routes);
+    }
+    ncclLsaBarrierSession<ncclCoopCta> barrier{
+        ncclCoopCta(), dev_comm, ncclTeamTagLsa{}, blockIdx.x, false};
+    barrier.sync(ncclCoopCta(), cuda::memory_order_acquire);
+  } else {
+    ncclBarrierSession<ncclCoopCta> barrier{
+        ncclCoopCta(), ncclTeamTagWorld(), gin, blockIdx.x};
+    barrier.sync(ncclCoopCta(), cuda::memory_order_acquire,
+                 ncclGinFenceLevel::None);
+  }
 
   for (int step = 0; step < lsa.nRanks; ++step) {
     const int destination_local =
@@ -182,6 +231,7 @@ __global__ void send_and_deliver_local(
         if (issuer_count == 0)
           continue;
         const std::size_t inbox_offset =
+            static_cast<std::size_t>(stage) * stage_bytes +
             rail.rank * domain_bytes + destination_local * slot_bytes +
             (offset + issuer_offset) * sizeof(value_type);
         gin.put(rail, destination_domain, inbox_window, inbox_offset,
@@ -189,7 +239,7 @@ __global__ void send_and_deliver_local(
                 (entry.send_offset + offset + issuer_offset) *
                     sizeof(value_type),
                 issuer_count * sizeof(value_type),
-                ncclGin_WeakSignalInc{signal});
+                ncclGin_WeakSignalInc{data_signal});
       }
     }
   }
@@ -200,7 +250,7 @@ __global__ void send_and_deliver_local(
 struct CompletionBlockTrace {
   std::uint64_t wait_begin;
   std::uint64_t wait_end;
-  std::uint64_t flush_end;
+  std::uint64_t first_finish_end;
   std::uint64_t finish_end;
 };
 
@@ -211,28 +261,31 @@ struct CompletionWarpTrace {
 
 constexpr int kWarpThreads = 32;
 
-template <bool kProfileCycles, bool kAsyncFlush>
+template <bool kProfileCycles, bool kAsyncFlush, bool kCreditPipeline>
 __global__ void wait_and_scatter(
     ncclDevComm dev_comm, ncclWindow_t recv_window,
     ncclWindow_t plan_window, ncclWindow_t inbox_window,
     std::size_t slot_bytes, std::size_t domain_bytes,
-    int route_shards, int network_issuers, std::uint64_t epoch,
+    std::size_t stage_bytes, int route_shards, int network_issuers,
+    std::uint64_t epoch,
     CompletionBlockTrace *block_traces, CompletionWarpTrace *warp_traces) {
 #if __CUDA_ARCH__ >= 700
   const int context_count =
       min(static_cast<int>(gridDim.x),
           static_cast<int>(dev_comm.ginContextCount));
   const int context = static_cast<int>(blockIdx.x) % context_count;
-  const ncclGinSignal_t signal =
-      static_cast<ncclGinSignal_t>(blockIdx.x);
+  const int stage =
+      kCreditPipeline ? static_cast<int>((epoch - 1) & 1) : 0;
+  const ncclGinSignal_t data_signal = static_cast<ncclGinSignal_t>(
+      kCreditPipeline ? stage * static_cast<int>(gridDim.x) + blockIdx.x
+                      : blockIdx.x);
   ncclGin gin{dev_comm, context};
-  ncclBarrierSession<ncclCoopCta> barrier{
-      ncclCoopCta(), ncclTeamTagWorld(), gin, blockIdx.x};
   const ncclTeam lsa = ncclTeamLsa(dev_comm);
   const ncclTeam rail = ncclTeamRail(dev_comm);
 
   const int task_count = rail.nRanks * lsa.nRanks;
   __shared__ std::uint64_t expected;
+  __shared__ std::uint64_t incoming_routes;
   __shared__ ncclGinRequest_t flush_request;
   if constexpr (kProfileCycles) {
     if (threadIdx.x == 0)
@@ -243,6 +296,7 @@ __global__ void wait_and_scatter(
   }
   if (threadIdx.x == 0) {
     expected = 0;
+    incoming_routes = 0;
     for (int task = 0; task < task_count; ++task) {
       const int source_domain = task / lsa.nRanks;
       const int destination_local = task % lsa.nRanks;
@@ -262,6 +316,7 @@ __global__ void wait_and_scatter(
         std::uint64_t offset = 0;
         std::uint64_t count = 0;
         shard_slice(entry.recv_count, shard, route_shards, &offset, &count);
+        incoming_routes += count != 0;
         for (int issuer = 0; issuer < network_issuers; ++issuer) {
           std::uint64_t issuer_offset = 0;
           std::uint64_t issuer_count = 0;
@@ -274,7 +329,9 @@ __global__ void wait_and_scatter(
   }
   __syncthreads();
   if (expected != 0) {
-    gin.waitSignal(ncclCoopCta(), signal, epoch * expected);
+    const std::uint64_t data_round =
+        kCreditPipeline ? (epoch + 1) / 2 : epoch;
+    gin.waitSignal(ncclCoopCta(), data_signal, data_round * expected);
   }
   if constexpr (kProfileCycles) {
     if (threadIdx.x == 0)
@@ -288,7 +345,7 @@ __global__ void wait_and_scatter(
   }
   scatter_assigned_shards(
       dev_comm, recv_window, plan_window, inbox_window, slot_bytes,
-      domain_bytes, route_shards);
+      domain_bytes, stage_bytes, stage, route_shards);
   if constexpr (kProfileCycles) {
     __syncwarp();
     if (threadIdx.x % kWarpThreads == 0) {
@@ -297,18 +354,46 @@ __global__ void wait_and_scatter(
           .scatter_end = clock64();
     }
   }
-  if constexpr (kAsyncFlush) {
+  if constexpr (kCreditPipeline) {
+    ncclLsaBarrierSession<ncclCoopCta> local_done{
+        ncclCoopCta(), dev_comm, ncclTeamTagLsa{}, blockIdx.x, false};
+    local_done.sync(ncclCoopCta(), cuda::memory_order_acq_rel);
+    if constexpr (kProfileCycles) {
+      if (threadIdx.x == 0)
+        block_traces[blockIdx.x].first_finish_end = clock64();
+    }
+    if (threadIdx.x == 0 && incoming_routes != 0) {
+      const ncclGinSignal_t credit_signal = static_cast<ncclGinSignal_t>(
+          (2 + stage) * static_cast<int>(gridDim.x) + blockIdx.x);
+      gin.signal(rail, 1 - rail.rank,
+                 ncclGin_WeakSignalAdd{credit_signal, incoming_routes},
+                 ncclCoopThread{}, ncclGin_None{},
+                 cuda::thread_scope_thread, cuda::thread_scope_system);
+    }
+    __syncthreads();
+    // This covers both the original outbound puts and the just-issued credit.
+    gin.flush(ncclCoopCta());
+  } else if constexpr (kAsyncFlush) {
     gin.wait(flush_request, ncclCoopCta());
+    if constexpr (kProfileCycles) {
+      if (threadIdx.x == 0)
+        block_traces[blockIdx.x].first_finish_end = clock64();
+    }
+    ncclBarrierSession<ncclCoopCta> barrier{
+        ncclCoopCta(), ncclTeamTagWorld(), gin, blockIdx.x};
+    barrier.sync(ncclCoopCta(), cuda::memory_order_acq_rel,
+                 ncclGinFenceLevel::None);
   } else {
     gin.flush(ncclCoopCta());
+    if constexpr (kProfileCycles) {
+      if (threadIdx.x == 0)
+        block_traces[blockIdx.x].first_finish_end = clock64();
+    }
+    ncclBarrierSession<ncclCoopCta> barrier{
+        ncclCoopCta(), ncclTeamTagWorld(), gin, blockIdx.x};
+    barrier.sync(ncclCoopCta(), cuda::memory_order_acq_rel,
+                 ncclGinFenceLevel::None);
   }
-  if constexpr (kProfileCycles) {
-    if (threadIdx.x == 0)
-      block_traces[blockIdx.x].flush_end = clock64();
-  }
-
-  barrier.sync(ncclCoopCta(), cuda::memory_order_acq_rel,
-               ncclGinFenceLevel::None);
   if constexpr (kProfileCycles) {
     if (threadIdx.x == 0)
       block_traces[blockIdx.x].finish_end = clock64();
@@ -316,41 +401,59 @@ __global__ void wait_and_scatter(
 #endif
 }
 
-void launch_send_and_deliver_local(const alltoallv::nccl_setup::State &state,
-                                   const alltoallv::Options &options,
-                                   int route_shards) {
-  send_and_deliver_local<<<options.blocks, options.threads, 0,
-                           state.stream>>>(
+template <bool kCreditPipeline>
+void launch_send_and_deliver_local_impl(
+    const alltoallv::nccl_setup::State &state,
+    const alltoallv::Options &options, int route_shards,
+    std::uint64_t epoch) {
+  send_and_deliver_local<kCreditPipeline>
+      <<<options.blocks, options.threads, 0, state.stream>>>(
       state.dev_comm, state.send_window, state.recv_window,
       state.plan_window, state.inbox_window, state.hybrid_slot_bytes,
-      state.hybrid_domain_bytes, route_shards, options.network_issuers);
+      state.hybrid_domain_bytes, state.hybrid_stage_bytes, route_shards,
+      options.network_issuers, epoch);
   ALLTOALLV_CUDA_CHECK(cudaGetLastError());
 }
 
-template <bool kProfileCycles, bool kAsyncFlush>
+void launch_send_and_deliver_local(const alltoallv::nccl_setup::State &state,
+                                   const alltoallv::Options &options,
+                                   int route_shards, std::uint64_t epoch) {
+  if (alltoallv::nccl_setup::uses_two_rail_credit_pipeline(state, options)) {
+    launch_send_and_deliver_local_impl<true>(state, options, route_shards,
+                                             epoch);
+  } else {
+    launch_send_and_deliver_local_impl<false>(state, options, route_shards,
+                                              epoch);
+  }
+}
+
+template <bool kProfileCycles, bool kAsyncFlush, bool kCreditPipeline>
 void launch_wait_and_scatter_impl(
     const alltoallv::nccl_setup::State &state,
     const alltoallv::Options &options, int route_shards,
     std::uint64_t epoch, CompletionBlockTrace *block_traces,
     CompletionWarpTrace *warp_traces) {
-  wait_and_scatter<kProfileCycles, kAsyncFlush>
+  wait_and_scatter<kProfileCycles, kAsyncFlush, kCreditPipeline>
       <<<options.blocks, options.threads, 0, state.stream>>>(
       state.dev_comm, state.recv_window, state.plan_window,
       state.inbox_window, state.hybrid_slot_bytes,
-      state.hybrid_domain_bytes, route_shards, options.network_issuers,
-      epoch, block_traces, warp_traces);
+      state.hybrid_domain_bytes, state.hybrid_stage_bytes, route_shards,
+      options.network_issuers, epoch, block_traces, warp_traces);
   ALLTOALLV_CUDA_CHECK(cudaGetLastError());
 }
 
 void launch_wait_and_scatter(const alltoallv::nccl_setup::State &state,
                              const alltoallv::Options &options,
                              int route_shards, std::uint64_t epoch) {
-  if (options.async_flush &&
+  if (alltoallv::nccl_setup::uses_two_rail_credit_pipeline(state, options)) {
+    launch_wait_and_scatter_impl<false, false, true>(
+        state, options, route_shards, epoch, nullptr, nullptr);
+  } else if (options.async_flush &&
       alltoallv::nccl_setup::supports_two_rail_async_flush(state)) {
-    launch_wait_and_scatter_impl<false, true>(
+    launch_wait_and_scatter_impl<false, true, false>(
         state, options, route_shards, epoch, nullptr, nullptr);
   } else {
-    launch_wait_and_scatter_impl<false, false>(
+    launch_wait_and_scatter_impl<false, false, false>(
         state, options, route_shards, epoch, nullptr, nullptr);
   }
 }
@@ -360,12 +463,15 @@ void launch_profiled_wait_and_scatter(
     const alltoallv::Options &options, int route_shards,
     std::uint64_t epoch, CompletionBlockTrace *block_traces,
     CompletionWarpTrace *warp_traces) {
-  if (options.async_flush &&
+  if (alltoallv::nccl_setup::uses_two_rail_credit_pipeline(state, options)) {
+    launch_wait_and_scatter_impl<true, false, true>(
+        state, options, route_shards, epoch, block_traces, warp_traces);
+  } else if (options.async_flush &&
       alltoallv::nccl_setup::supports_two_rail_async_flush(state)) {
-    launch_wait_and_scatter_impl<true, true>(
+    launch_wait_and_scatter_impl<true, true, false>(
         state, options, route_shards, epoch, block_traces, warp_traces);
   } else {
-    launch_wait_and_scatter_impl<true, false>(
+    launch_wait_and_scatter_impl<true, false, false>(
         state, options, route_shards, epoch, block_traces, warp_traces);
   }
 }
@@ -373,7 +479,7 @@ void launch_profiled_wait_and_scatter(
 void launch(const alltoallv::nccl_setup::State &state,
             const alltoallv::Options &options, int route_shards,
             std::uint64_t epoch) {
-  launch_send_and_deliver_local(state, options, route_shards);
+  launch_send_and_deliver_local(state, options, route_shards, epoch);
   launch_wait_and_scatter(state, options, route_shards, epoch);
 }
 
@@ -382,8 +488,8 @@ struct PhaseTimes {
   float wait_and_scatter_ms = 0.0f;
   float plan_and_wait_cta_ms = 0.0f;
   float scatter_cta_ms = 0.0f;
-  float flush_cta_ms = 0.0f;
-  float barrier_cta_ms = 0.0f;
+  float first_finish_cta_ms = 0.0f;
+  float second_finish_cta_ms = 0.0f;
 };
 
 PhaseTimes profile_iterations(const alltoallv::nccl_setup::State &state,
@@ -417,11 +523,12 @@ PhaseTimes profile_iterations(const alltoallv::nccl_setup::State &state,
   }
   for (int iteration = 0; iteration < options.iterations; ++iteration) {
     ALLTOALLV_CUDA_CHECK(cudaEventRecord(starts[iteration], state.stream));
-    launch_send_and_deliver_local(state, options, route_shards);
+    const std::uint64_t next_epoch = ++*epoch;
+    launch_send_and_deliver_local(state, options, route_shards, next_epoch);
     ALLTOALLV_CUDA_CHECK(
         cudaEventRecord(handoffs[iteration], state.stream));
     launch_profiled_wait_and_scatter(
-        state, options, route_shards, ++*epoch,
+        state, options, route_shards, next_epoch,
         device_block_traces + iteration * block_traces_per_iteration,
         device_warp_traces + iteration * warp_traces_per_iteration);
     ALLTOALLV_CUDA_CHECK(cudaEventRecord(stops[iteration], state.stream));
@@ -454,8 +561,8 @@ PhaseTimes profile_iterations(const alltoallv::nccl_setup::State &state,
 
   std::uint64_t plan_and_wait_cycles = 0;
   std::uint64_t scatter_cycles = 0;
-  std::uint64_t flush_cycles = 0;
-  std::uint64_t barrier_cycles = 0;
+  std::uint64_t first_finish_cycles = 0;
+  std::uint64_t second_finish_cycles = 0;
   for (int iteration = 0; iteration < options.iterations; ++iteration) {
     const CompletionBlockTrace *block_values =
         host_block_traces.data() + iteration * block_traces_per_iteration;
@@ -485,24 +592,25 @@ PhaseTimes profile_iterations(const alltoallv::nccl_setup::State &state,
     // Attribute the entire critical-CTA scatter span, including any warp
     // scheduling skew, so the trace buckets form one elapsed-time partition.
     scatter_cycles += latest_scatter_end - trace.wait_end;
-    flush_cycles += trace.flush_end > latest_scatter_end
-                        ? trace.flush_end - latest_scatter_end
-                        : 0;
-    barrier_cycles += trace.finish_end > trace.flush_end
-                          ? trace.finish_end - trace.flush_end
-                          : 0;
+    first_finish_cycles += trace.first_finish_end > latest_scatter_end
+                               ? trace.first_finish_end - latest_scatter_end
+                               : 0;
+    second_finish_cycles += trace.finish_end > trace.first_finish_end
+                                ? trace.finish_end - trace.first_finish_end
+                                : 0;
   }
   const double traced_cycles = static_cast<double>(plan_and_wait_cycles) +
-                               scatter_cycles + flush_cycles + barrier_cycles;
+                               scatter_cycles + first_finish_cycles +
+                               second_finish_cycles;
   if (traced_cycles != 0.0) {
     result.plan_and_wait_cta_ms = static_cast<float>(
         result.wait_and_scatter_ms * plan_and_wait_cycles / traced_cycles);
     result.scatter_cta_ms = static_cast<float>(
         result.wait_and_scatter_ms * scatter_cycles / traced_cycles);
-    result.flush_cta_ms = static_cast<float>(
-        result.wait_and_scatter_ms * flush_cycles / traced_cycles);
-    result.barrier_cta_ms = static_cast<float>(
-        result.wait_and_scatter_ms * barrier_cycles / traced_cycles);
+    result.first_finish_cta_ms = static_cast<float>(
+        result.wait_and_scatter_ms * first_finish_cycles / traced_cycles);
+    result.second_finish_cta_ms = static_cast<float>(
+        result.wait_and_scatter_ms * second_finish_cycles / traced_cycles);
   }
   return result;
 }
@@ -528,8 +636,8 @@ void report_completion_trace_timing(
       "MPI_Allreduce(completion trace critical rank)");
   float critical_phase_ms[4] = {phases.plan_and_wait_cta_ms,
                                 phases.scatter_cta_ms,
-                                phases.flush_cta_ms,
-                                phases.barrier_cta_ms};
+                                phases.first_finish_cta_ms,
+                                phases.second_finish_cta_ms};
   alltoallv::mpi_check(
       MPI_Bcast(critical_phase_ms, 4, MPI_FLOAT, critical.rank,
                 MPI_COMM_WORLD),
@@ -543,28 +651,35 @@ void report_completion_trace_timing(
       total_ms == 0.0f ? 0.0f : 100.0f * critical_phase_ms[0] / total_ms;
   const float scatter_fraction =
       total_ms == 0.0f ? 0.0f : 100.0f * critical_phase_ms[1] / total_ms;
-  const float flush_fraction =
+  const float first_finish_fraction =
       total_ms == 0.0f ? 0.0f : 100.0f * critical_phase_ms[2] / total_ms;
-  const float barrier_fraction =
+  const float second_finish_fraction =
       total_ms == 0.0f ? 0.0f : 100.0f * critical_phase_ms[3] / total_ms;
+  const bool use_credit_pipeline =
+      alltoallv::nccl_setup::uses_two_rail_credit_pipeline(state, options);
   const bool use_async_flush =
       options.async_flush &&
       alltoallv::nccl_setup::supports_two_rail_async_flush(state);
   const char *wait_label =
       use_async_flush ? "async flush start + plan + signal wait"
-                      : "plan + signal wait";
-  const char *flush_label =
-      use_async_flush ? "GIN flush wait" : "GIN flush";
+                      : use_credit_pipeline ? "plan + slot data wait"
+                                            : "plan + signal wait";
+  const char *first_finish_label =
+      use_credit_pipeline ? "LSA completion barrier"
+                          : use_async_flush ? "GIN flush wait" : "GIN flush";
+  const char *second_finish_label =
+      use_credit_pipeline ? "credit signal + GIN flush" : "world barrier";
   std::printf(
       "%s completion trace: %.3f ms/iteration %s (%.1f%%), %.3f "
       "ms/iteration LSA scatter (%.1f%%), %.3f ms/iteration %s "
-      "(%.1f%%), %.3f ms/iteration world barrier (%.1f%%; critical CTA, "
+      "(%.1f%%), %.3f ms/iteration %s (%.1f%%; critical CTA, "
       "CUDA-event-scaled)\n",
       implementation, critical_phase_ms[0] / options.iterations, wait_label,
       plan_fraction, critical_phase_ms[1] / options.iterations,
       scatter_fraction, critical_phase_ms[2] / options.iterations,
-      flush_label, flush_fraction, critical_phase_ms[3] / options.iterations,
-      barrier_fraction);
+      first_finish_label, first_finish_fraction,
+      critical_phase_ms[3] / options.iterations, second_finish_label,
+      second_finish_fraction);
 }
 
 int choose_route_shards(const alltoallv::nccl_setup::State &state,
@@ -616,6 +731,8 @@ int main(int argc, char **argv) {
   const bool use_async_flush =
       options.async_flush &&
       alltoallv::nccl_setup::supports_two_rail_async_flush(state);
+  const bool use_credit_pipeline =
+      alltoallv::nccl_setup::uses_two_rail_credit_pipeline(state, options);
   if (state.rank == 0) {
     std::printf(
         "NCCL hybrid routing: %d shard(s) per remote route, %d issuer(s) "
@@ -626,6 +743,15 @@ int main(int argc, char **argv) {
       std::printf(
           "NCCL hybrid routing: --async-flush needs two rail ranks and a "
           "backend with peer async completion; using the synchronous flush\n");
+    }
+    if (use_credit_pipeline) {
+      std::printf(
+          "NCCL hybrid completion: two inbox stages, per-slot credits, and "
+          "LSA barriers (world barrier disabled)\n");
+    } else if (options.credit_pipeline) {
+      std::printf(
+          "NCCL hybrid completion: --credit-pipeline needs exactly two rail "
+          "ranks; using the world barrier\n");
     }
   }
   std::uint64_t epoch = 1;

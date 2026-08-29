@@ -68,6 +68,8 @@ struct State {
   std::size_t plan_bytes = 0;
   std::size_t hybrid_slot_bytes = 0;
   std::size_t hybrid_domain_bytes = 0;
+  std::size_t hybrid_stage_bytes = 0;
+  int hybrid_inbox_stages = 1;
   std::size_t staging_bytes = 0;
 };
 
@@ -111,6 +113,11 @@ inline bool supports_two_rail_async_flush(const State &state) {
   default:
     return false;
   }
+}
+
+inline bool uses_two_rail_credit_pipeline(const State &state,
+                                          const Options &options) {
+  return options.credit_pipeline && state.rail_team.nRanks == 2;
 }
 
 inline void finish(State *state) {
@@ -359,6 +366,10 @@ inline SetupResult prepare(State *state, int *argc, char ***argv,
     return SetupResult::Skipped;
   }
 
+  const bool use_credit_pipeline =
+      backend == Backend::HybridRail &&
+      uses_two_rail_credit_pipeline(*state, *options);
+
   state->send_bytes = std::max<std::size_t>(
       1, plan->global_send_capacity * sizeof(value_type));
   state->recv_bytes = std::max<std::size_t>(
@@ -370,9 +381,11 @@ inline SetupResult prepare(State *state, int *argc, char ***argv,
         align_bytes(plan->max_pair_count * sizeof(value_type));
     state->hybrid_domain_bytes =
         state->lsa_team.nRanks * state->hybrid_slot_bytes;
+    state->hybrid_stage_bytes = std::max<std::size_t>(
+        1, state->rail_team.nRanks * state->hybrid_domain_bytes);
+    state->hybrid_inbox_stages = use_credit_pipeline ? 2 : 1;
     state->staging_bytes =
-        std::max<std::size_t>(1, state->rail_team.nRanks *
-                                    state->hybrid_domain_bytes);
+        state->hybrid_inbox_stages * state->hybrid_stage_bytes;
   }
 
   ALLTOALLV_NCCL_CHECK(ncclMemAlloc(&state->send, state->send_bytes));
@@ -418,6 +431,8 @@ inline SetupResult prepare(State *state, int *argc, char ***argv,
       NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
   const int requested_gin_contexts =
       alltoallv::requested_gin_contexts(*options);
+  const int requested_gin_signals =
+      use_credit_pipeline ? 4 * options->blocks : options->blocks;
   if (backend == Backend::Lsa) {
     requirements.lsaBarrierCount = options->blocks;
   } else if (backend == Backend::Gin) {
@@ -430,8 +445,11 @@ inline SetupResult prepare(State *state, int *argc, char ***argv,
     requirements.ginVaSignalsRequired = false;
   } else {
     requirements.ginContextCount = requested_gin_contexts;
-    requirements.barrierCount = options->blocks;
-    requirements.ginSignalCount = options->blocks;
+    if (use_credit_pipeline)
+      requirements.lsaBarrierCount = options->blocks;
+    else
+      requirements.barrierCount = options->blocks;
+    requirements.ginSignalCount = requested_gin_signals;
     requirements.ginQueueDepth = options->gin_queue_depth;
     requirements.ginConnectionType = NCCL_GIN_CONNECTION_RAIL;
     requirements.ginStrongSignalsRequired = false;
@@ -457,8 +475,9 @@ inline SetupResult prepare(State *state, int *argc, char ***argv,
     const bool uniform_resources =
         minimum_resources[0] == maximum_resources[0] &&
         minimum_resources[1] == maximum_resources[1];
-    const bool resources_sufficient =
-        local_resources[0] > 0 && local_resources[1] >= options->blocks;
+    const bool resources_sufficient = local_resources[0] > 0 &&
+                                      local_resources[1] >=
+                                          requested_gin_signals;
     const int local_resources_ready =
         uniform_resources && resources_sufficient;
     int all_resources_ready = 0;
@@ -474,7 +493,7 @@ inline SetupResult prepare(State *state, int *argc, char ***argv,
                     "contexts and at least %d signals)",
                     minimum_resources[0], maximum_resources[0],
                     minimum_resources[1], maximum_resources[1],
-                    options->blocks);
+                    requested_gin_signals);
       print_skip(*state, reason);
       return SetupResult::Skipped;
     }

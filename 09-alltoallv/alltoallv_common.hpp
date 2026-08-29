@@ -37,6 +37,9 @@ struct Options {
   int network_issuers = 1;
   // Overlap a two-rail GIN source-completion flush with receive work.
   bool async_flush = false;
+  // Double-buffer the hybrid inbox and return per-slot credits instead of
+  // taking the cross-domain world barrier after every epoch.
+  bool credit_pipeline = false;
   bool profile_phases = false;
   bool help = false;
 };
@@ -114,6 +117,7 @@ inline void print_usage(const char *program,
       "[--gin-queue-depth N] %s[--profile-phases]\n",
       program, allow_hybrid_options
                    ? "[--network-issuers N] [--async-flush] "
+                     "[--credit-pipeline] "
                    : "");
 }
 
@@ -154,6 +158,9 @@ inline Options parse_options(int argc, char **argv, int rank,
     } else if (allow_hybrid_options &&
                std::strcmp(argv[i], "--async-flush") == 0) {
       options.async_flush = true;
+    } else if (allow_hybrid_options &&
+               std::strcmp(argv[i], "--credit-pipeline") == 0) {
+      options.credit_pipeline = true;
     } else if (std::strcmp(argv[i], "--profile-phases") == 0) {
       options.profile_phases = true;
     } else if (std::strcmp(argv[i], "--help") == 0 ||
@@ -177,7 +184,8 @@ inline Options parse_options(int argc, char **argv, int rank,
        options.threads % 32 != 0 || options.gin_contexts < 0 ||
        options.gin_contexts > options.blocks ||
        options.gin_queue_depth < 0 || options.network_issuers < 1 ||
-       options.network_issuers > options.threads)) {
+       options.network_issuers > options.threads ||
+       (options.async_flush && options.credit_pipeline))) {
     if (rank == 0) {
       std::fprintf(stderr, "Invalid arguments\n");
       print_usage(argv[0], allow_hybrid_options);
@@ -193,7 +201,7 @@ inline int requested_gin_contexts(const Options &options) {
 
 inline void require_matching_collective_options(const Options &options,
                                                 int rank) {
-  int values[9] = {options.blocks,
+  int values[10] = {options.blocks,
                    options.threads,
                    options.warmup,
                    options.iterations,
@@ -201,23 +209,24 @@ inline void require_matching_collective_options(const Options &options,
                    options.gin_queue_depth,
                    options.network_issuers,
                    static_cast<int>(options.async_flush),
+                   static_cast<int>(options.credit_pipeline),
                    static_cast<int>(options.profile_phases)};
-  int minima[9];
-  int maxima[9];
-  mpi_check(MPI_Allreduce(values, minima, 9, MPI_INT, MPI_MIN,
+  int minima[10];
+  int maxima[10];
+  mpi_check(MPI_Allreduce(values, minima, 10, MPI_INT, MPI_MIN,
                           MPI_COMM_WORLD),
             "MPI_Allreduce(option minimum)");
-  mpi_check(MPI_Allreduce(values, maxima, 9, MPI_INT, MPI_MAX,
+  mpi_check(MPI_Allreduce(values, maxima, 10, MPI_INT, MPI_MAX,
                           MPI_COMM_WORLD),
             "MPI_Allreduce(option maximum)");
-  for (int i = 0; i < 9; ++i) {
+  for (int i = 0; i < 10; ++i) {
     if (minima[i] == maxima[i])
       continue;
     if (rank == 0) {
       std::fprintf(stderr,
                    "--blocks, --threads, --warmup, --iters, --gin-contexts, "
-                   "--gin-queue-depth, --network-issuers, --async-flush, and "
-                   "--profile-phases must match on "
+                   "--gin-queue-depth, --network-issuers, --async-flush, "
+                   "--credit-pipeline, and --profile-phases must match on "
                    "every rank\n");
     }
     MPI_Abort(MPI_COMM_WORLD, 1);
