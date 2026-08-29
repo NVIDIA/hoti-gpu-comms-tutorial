@@ -913,15 +913,36 @@ int main(int argc, char **argv) {
 
   if (options.epoch_stress != 0) {
     alltoallv::nccl_setup::clear_recv_for_reuse(&state);
+    // Keep the penultimate output so the final check covers both alternating
+    // inbox stages without a host synchronization inside the stress loop.
+    value_type *penultimate_recv = nullptr;
+    ALLTOALLV_CUDA_CHECK(cudaMalloc(&penultimate_recv, state.recv_bytes));
     value_type bias = 0;
+    value_type penultimate_bias = 0;
     for (int i = 0; i < options.epoch_stress; ++i) {
       bias = static_cast<value_type>(bias + alltoallv::kEpochStressDelta);
       stamp_send_for_epoch_stress(state, options, plan);
       launch(state, options, route_shards, ++epoch);
+      if (i + 2 == options.epoch_stress) {
+        penultimate_bias = bias;
+        ALLTOALLV_CUDA_CHECK(cudaMemcpyAsync(
+            penultimate_recv, state.recv, state.recv_bytes,
+            cudaMemcpyDeviceToDevice, state.stream));
+      }
     }
     ALLTOALLV_CUDA_CHECK(cudaStreamSynchronize(state.stream));
+    errors = alltoallv::nccl_setup::copy_buffer_and_validate(
+        &state, penultimate_recv, plan,
+        "NCCL LSA + railed GIN AlltoAllV epoch stress penultimate",
+        penultimate_bias);
+    ALLTOALLV_CUDA_CHECK(cudaFree(penultimate_recv));
+    if (errors != 0) {
+      alltoallv::nccl_setup::finish(&state);
+      return 1;
+    }
     errors = alltoallv::nccl_setup::copy_and_validate(
-        &state, plan, "NCCL LSA + railed GIN AlltoAllV epoch stress", bias);
+        &state, plan, "NCCL LSA + railed GIN AlltoAllV epoch stress final",
+        bias);
     if (errors != 0) {
       alltoallv::nccl_setup::finish(&state);
       return 1;
