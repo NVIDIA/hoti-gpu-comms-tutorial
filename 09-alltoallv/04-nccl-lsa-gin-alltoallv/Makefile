@@ -27,6 +27,8 @@ BINS := nccl_lsa_gin_alltoallv nccl_lsa_gin_alltoallv_SOLVED
 
 all: $(BINS)
 
+$(BINS): ../alltoallv_build.mk
+
 nccl_lsa_gin_alltoallv: nccl_lsa_gin_alltoallv.cu ../nccl_alltoallv_setup.hpp ../alltoallv_common.hpp
 	$(NVCC) -ccbin $(MPICXX) $(CPPFLAGS) $(NVCCFLAGS) $< $(LDFLAGS) $(LDLIBS) -o $@
 

@@ -35,6 +35,8 @@ BINS := nvshmem_alltoallv nvshmem_alltoallv_SOLVED
 
 all: $(BINS)
 
+$(BINS): ../alltoallv_build.mk
+
 nvshmem_alltoallv: nvshmem_alltoallv.cu ../alltoallv_common.hpp \
 	../../common/nvshmem_exercise.h
 	$(NVCC) $(NVCC_FLAGS) $< -o $@ $(NVCC_LDFLAGS)
