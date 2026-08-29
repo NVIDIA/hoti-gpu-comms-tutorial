@@ -197,11 +197,26 @@ __global__ void send_and_deliver_local(
 #endif
 }
 
+struct CompletionBlockTrace {
+  std::uint64_t wait_begin;
+  std::uint64_t wait_end;
+  std::uint64_t finish_end;
+};
+
+struct CompletionWarpTrace {
+  std::uint64_t scatter_begin;
+  std::uint64_t scatter_end;
+};
+
+constexpr int kWarpThreads = 32;
+
+template <bool kProfileCycles>
 __global__ void wait_and_scatter(
     ncclDevComm dev_comm, ncclWindow_t recv_window,
     ncclWindow_t plan_window, ncclWindow_t inbox_window,
     std::size_t slot_bytes, std::size_t domain_bytes,
-    int route_shards, int network_issuers, std::uint64_t epoch) {
+    int route_shards, int network_issuers, std::uint64_t epoch,
+    CompletionBlockTrace *block_traces, CompletionWarpTrace *warp_traces) {
 #if __CUDA_ARCH__ >= 700
   const int context_count =
       min(static_cast<int>(gridDim.x),
@@ -217,6 +232,10 @@ __global__ void wait_and_scatter(
 
   const int task_count = rail.nRanks * lsa.nRanks;
   __shared__ std::uint64_t expected;
+  if constexpr (kProfileCycles) {
+    if (threadIdx.x == 0)
+      block_traces[blockIdx.x].wait_begin = clock64();
+  }
   if (threadIdx.x == 0) {
     expected = 0;
     for (int task = 0; task < task_count; ++task) {
@@ -252,13 +271,35 @@ __global__ void wait_and_scatter(
   if (expected != 0) {
     gin.waitSignal(ncclCoopCta(), signal, epoch * expected);
   }
+  if constexpr (kProfileCycles) {
+    if (threadIdx.x == 0)
+      block_traces[blockIdx.x].wait_end = clock64();
+    __syncwarp();
+    if (threadIdx.x % kWarpThreads == 0) {
+      const int warp = threadIdx.x / kWarpThreads;
+      warp_traces[blockIdx.x * (blockDim.x / kWarpThreads) + warp]
+          .scatter_begin = clock64();
+    }
+  }
   scatter_assigned_shards(
       dev_comm, recv_window, plan_window, inbox_window, slot_bytes,
       domain_bytes, route_shards);
+  if constexpr (kProfileCycles) {
+    __syncwarp();
+    if (threadIdx.x % kWarpThreads == 0) {
+      const int warp = threadIdx.x / kWarpThreads;
+      warp_traces[blockIdx.x * (blockDim.x / kWarpThreads) + warp]
+          .scatter_end = clock64();
+    }
+  }
   gin.flush(ncclCoopCta());
 
   barrier.sync(ncclCoopCta(), cuda::memory_order_acq_rel,
                ncclGinFenceLevel::None);
+  if constexpr (kProfileCycles) {
+    if (threadIdx.x == 0)
+      block_traces[blockIdx.x].finish_end = clock64();
+  }
 #endif
 }
 
@@ -276,11 +317,24 @@ void launch_send_and_deliver_local(const alltoallv::nccl_setup::State &state,
 void launch_wait_and_scatter(const alltoallv::nccl_setup::State &state,
                              const alltoallv::Options &options,
                              int route_shards, std::uint64_t epoch) {
-  wait_and_scatter<<<options.blocks, options.threads, 0, state.stream>>>(
+  wait_and_scatter<false><<<options.blocks, options.threads, 0, state.stream>>>(
       state.dev_comm, state.recv_window, state.plan_window,
       state.inbox_window, state.hybrid_slot_bytes,
       state.hybrid_domain_bytes, route_shards, options.network_issuers,
-      epoch);
+      epoch, nullptr, nullptr);
+  ALLTOALLV_CUDA_CHECK(cudaGetLastError());
+}
+
+void launch_profiled_wait_and_scatter(
+    const alltoallv::nccl_setup::State &state,
+    const alltoallv::Options &options, int route_shards,
+    std::uint64_t epoch, CompletionBlockTrace *block_traces,
+    CompletionWarpTrace *warp_traces) {
+  wait_and_scatter<true><<<options.blocks, options.threads, 0, state.stream>>>(
+      state.dev_comm, state.recv_window, state.plan_window,
+      state.inbox_window, state.hybrid_slot_bytes,
+      state.hybrid_domain_bytes, route_shards, options.network_issuers,
+      epoch, block_traces, warp_traces);
   ALLTOALLV_CUDA_CHECK(cudaGetLastError());
 }
 
@@ -294,11 +348,32 @@ void launch(const alltoallv::nccl_setup::State &state,
 struct PhaseTimes {
   float send_and_deliver_ms = 0.0f;
   float wait_and_scatter_ms = 0.0f;
+  float plan_and_wait_cta_ms = 0.0f;
+  float scatter_cta_ms = 0.0f;
+  float flush_and_barrier_cta_ms = 0.0f;
 };
 
 PhaseTimes profile_iterations(const alltoallv::nccl_setup::State &state,
                               const alltoallv::Options &options,
                               int route_shards, std::uint64_t *epoch) {
+  const std::size_t block_traces_per_iteration = options.blocks;
+  const std::size_t warp_traces_per_iteration =
+      block_traces_per_iteration * options.threads / kWarpThreads;
+  CompletionBlockTrace *device_block_traces = nullptr;
+  CompletionWarpTrace *device_warp_traces = nullptr;
+  std::vector<CompletionBlockTrace> host_block_traces(
+      static_cast<std::size_t>(options.iterations) *
+      block_traces_per_iteration);
+  std::vector<CompletionWarpTrace> host_warp_traces(
+      static_cast<std::size_t>(options.iterations) *
+      warp_traces_per_iteration);
+  ALLTOALLV_CUDA_CHECK(cudaMalloc(
+      &device_block_traces,
+      host_block_traces.size() * sizeof(*device_block_traces)));
+  ALLTOALLV_CUDA_CHECK(cudaMalloc(
+      &device_warp_traces,
+      host_warp_traces.size() * sizeof(*device_warp_traces)));
+
   std::vector<cudaEvent_t> starts(options.iterations);
   std::vector<cudaEvent_t> handoffs(options.iterations);
   std::vector<cudaEvent_t> stops(options.iterations);
@@ -312,10 +387,23 @@ PhaseTimes profile_iterations(const alltoallv::nccl_setup::State &state,
     launch_send_and_deliver_local(state, options, route_shards);
     ALLTOALLV_CUDA_CHECK(
         cudaEventRecord(handoffs[iteration], state.stream));
-    launch_wait_and_scatter(state, options, route_shards, ++*epoch);
+    launch_profiled_wait_and_scatter(
+        state, options, route_shards, ++*epoch,
+        device_block_traces + iteration * block_traces_per_iteration,
+        device_warp_traces + iteration * warp_traces_per_iteration);
     ALLTOALLV_CUDA_CHECK(cudaEventRecord(stops[iteration], state.stream));
   }
   ALLTOALLV_CUDA_CHECK(cudaEventSynchronize(stops.back()));
+  ALLTOALLV_CUDA_CHECK(cudaMemcpy(
+      host_block_traces.data(), device_block_traces,
+      host_block_traces.size() * sizeof(*device_block_traces),
+      cudaMemcpyDeviceToHost));
+  ALLTOALLV_CUDA_CHECK(cudaMemcpy(
+      host_warp_traces.data(), device_warp_traces,
+      host_warp_traces.size() * sizeof(*device_warp_traces),
+      cudaMemcpyDeviceToHost));
+  ALLTOALLV_CUDA_CHECK(cudaFree(device_warp_traces));
+  ALLTOALLV_CUDA_CHECK(cudaFree(device_block_traces));
 
   PhaseTimes result;
   for (int iteration = 0; iteration < options.iterations; ++iteration) {
@@ -330,7 +418,102 @@ PhaseTimes profile_iterations(const alltoallv::nccl_setup::State &state,
     ALLTOALLV_CUDA_CHECK(cudaEventDestroy(handoffs[iteration]));
     ALLTOALLV_CUDA_CHECK(cudaEventDestroy(starts[iteration]));
   }
+
+  std::uint64_t plan_and_wait_cycles = 0;
+  std::uint64_t scatter_cycles = 0;
+  std::uint64_t flush_and_barrier_cycles = 0;
+  for (int iteration = 0; iteration < options.iterations; ++iteration) {
+    const CompletionBlockTrace *block_values =
+        host_block_traces.data() + iteration * block_traces_per_iteration;
+    const CompletionWarpTrace *warp_values =
+        host_warp_traces.data() + iteration * warp_traces_per_iteration;
+    int slowest_block = 0;
+    std::uint64_t slowest_total = 0;
+    for (int block = 0; block < options.blocks; ++block) {
+      const CompletionBlockTrace &trace = block_values[block];
+      const std::uint64_t total = trace.finish_end - trace.wait_begin;
+      if (total > slowest_total) {
+        slowest_total = total;
+        slowest_block = block;
+      }
+    }
+    const CompletionBlockTrace &trace = block_values[slowest_block];
+    plan_and_wait_cycles += trace.wait_end - trace.wait_begin;
+
+    std::uint64_t longest_scatter = 0;
+    std::uint64_t latest_scatter_end = trace.wait_end;
+    for (int warp = 0; warp < options.threads / kWarpThreads; ++warp) {
+      const CompletionWarpTrace &warp_trace =
+          warp_values[slowest_block * (options.threads / kWarpThreads) +
+                      warp];
+      longest_scatter = std::max(
+          longest_scatter, warp_trace.scatter_end - warp_trace.scatter_begin);
+      latest_scatter_end =
+          std::max(latest_scatter_end, warp_trace.scatter_end);
+    }
+    scatter_cycles += longest_scatter;
+    flush_and_barrier_cycles +=
+        trace.finish_end > latest_scatter_end
+            ? trace.finish_end - latest_scatter_end
+            : 0;
+  }
+  const double traced_cycles = static_cast<double>(plan_and_wait_cycles) +
+                               scatter_cycles + flush_and_barrier_cycles;
+  if (traced_cycles != 0.0) {
+    result.plan_and_wait_cta_ms = static_cast<float>(
+        result.wait_and_scatter_ms * plan_and_wait_cycles / traced_cycles);
+    result.scatter_cta_ms = static_cast<float>(
+        result.wait_and_scatter_ms * scatter_cycles / traced_cycles);
+    result.flush_and_barrier_cta_ms = static_cast<float>(
+        result.wait_and_scatter_ms * flush_and_barrier_cycles / traced_cycles);
+  }
   return result;
+}
+
+void report_completion_trace_timing(const alltoallv::Options &options,
+                                    const char *implementation,
+                                    const PhaseTimes &phases) {
+  if (!options.profile_phases)
+    return;
+  int rank = 0;
+  alltoallv::mpi_check(MPI_Comm_rank(MPI_COMM_WORLD, &rank),
+                       "MPI_Comm_rank(completion trace)");
+  struct FloatRank {
+    float value;
+    int rank;
+  };
+  FloatRank local{phases.wait_and_scatter_ms, rank};
+  FloatRank critical{};
+  alltoallv::mpi_check(
+      MPI_Allreduce(&local, &critical, 1, MPI_FLOAT_INT, MPI_MAXLOC,
+                    MPI_COMM_WORLD),
+      "MPI_Allreduce(completion trace critical rank)");
+  float critical_phase_ms[3] = {phases.plan_and_wait_cta_ms,
+                                phases.scatter_cta_ms,
+                                phases.flush_and_barrier_cta_ms};
+  alltoallv::mpi_check(
+      MPI_Bcast(critical_phase_ms, 3, MPI_FLOAT, critical.rank,
+                MPI_COMM_WORLD),
+      "MPI_Bcast(completion trace critical phases)");
+  if (rank != 0)
+    return;
+
+  const float total_ms = critical_phase_ms[0] + critical_phase_ms[1] +
+                         critical_phase_ms[2];
+  const float plan_fraction =
+      total_ms == 0.0f ? 0.0f : 100.0f * critical_phase_ms[0] / total_ms;
+  const float scatter_fraction =
+      total_ms == 0.0f ? 0.0f : 100.0f * critical_phase_ms[1] / total_ms;
+  const float flush_fraction =
+      total_ms == 0.0f ? 0.0f : 100.0f * critical_phase_ms[2] / total_ms;
+  std::printf(
+      "%s completion trace: %.3f ms/iteration plan + signal wait (%.1f%%), "
+      "%.3f ms/iteration LSA scatter (%.1f%%), %.3f ms/iteration GIN "
+      "flush + barrier (%.1f%%; critical CTA, CUDA-event-scaled)\n",
+      implementation, critical_phase_ms[0] / options.iterations,
+      plan_fraction, critical_phase_ms[1] / options.iterations,
+      scatter_fraction, critical_phase_ms[2] / options.iterations,
+      flush_fraction);
 }
 
 int choose_route_shards(const alltoallv::nccl_setup::State &state,
@@ -426,6 +609,8 @@ int main(int argc, char **argv) {
     alltoallv::report_phase_timing(
         options, "NCCL LSA + railed GIN AlltoAllV",
         phases.send_and_deliver_ms, phases.wait_and_scatter_ms);
+    report_completion_trace_timing(
+        options, "NCCL LSA + railed GIN AlltoAllV", phases);
   }
 
   ALLTOALLV_CUDA_CHECK(

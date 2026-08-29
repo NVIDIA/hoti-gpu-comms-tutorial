@@ -254,6 +254,12 @@ scatter + flush`. Use it to choose the next algorithmic experiment, then turn
 the flag off for the throughput number because the optional per-iteration CUDA
 events add measurement overhead.
 
+The solved build also emits a completion trace that splits the latter phase
+into plan/signal wait, LSA scatter, and GIN flush/barrier. It chooses the
+slowest CTA per iteration and scales those device-clock ratios to the
+CUDA-event completion time, so use it to identify the next experiment rather
+than as a standalone throughput number.
+
 CTA count affects both the LSA copy and the requested GIN-context count. Start
 with the default for small messages. On the Lyris placement above, start
 large-message tuning with `--blocks 40 --threads 512`, then sweep the CTA
