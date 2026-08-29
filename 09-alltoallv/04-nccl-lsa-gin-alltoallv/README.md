@@ -183,12 +183,15 @@ With epochs starting at one, `stage = (epoch - 1) & 1` and
 the sender reuses a stage, it waits for
 `(round - 1) * outgoing_nonempty_route_shards` on the matching credit signal.
 The first use of each stage needs no credit. On the receiving CTA, the order is
-data wait, LSA scatter, an acquire/release LSA barrier, then one zero-byte GIN
-`WeakSignalAdd` credit back to the source rail rank. The local LSA barrier is
-essential: this collective also directly writes final receive buffers through
-LSA, so a GIN-only credit would not safely publish that local work. The credit
-signal requests a system-scope release, and the subsequent `gin.flush` covers
-both the original outbound puts and that credit notification.
+data wait, LSA scatter, a CTA synchronization, then one zero-byte GIN
+`WeakSignalAdd` credit back to the source rail rank. The CTA synchronization is
+enough to protect that CTA's inbox shard from early reuse. The collective then
+still performs its acquire/release LSA barrier before returning: it makes every
+same-domain direct write and ingress scatter visible in the final receive
+buffers. Posting the credit before this necessary completion barrier lets the
+peer begin its next eligible stage while local output completion continues. The
+credit signal requests a system-scope release, and the subsequent `gin.flush`
+covers both the original outbound puts and that credit notification.
 
 The option activates only with exactly two rail ranks. Other rail-team shapes
 keep the default world-barrier path. It doubles the inbox allocation and uses
@@ -319,7 +322,7 @@ rather than as a standalone throughput number.
 With `--async-flush`, the trace labels the asynchronous flush start with the
 first phase and its later completion wait with the flush phase. With
 `--credit-pipeline`, the final two labels instead show the LSA completion
-barrier and the returned credit plus GIN flush.
+barrier (including the early credit launch) and the GIN flush.
 
 CTA count affects both the LSA copy and the requested GIN-context count. Start
 with the default for small messages. On the Lyris placement above, start

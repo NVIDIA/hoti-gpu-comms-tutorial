@@ -176,9 +176,6 @@ __global__ void send_and_deliver_local(
       // to reach ((epoch - 1) / 2) * outgoing_routes on credit_signal.
       (void)credit_signal;
     }
-    ncclLsaBarrierSession<ncclCoopCta> barrier{
-        ncclCoopCta(), dev_comm, ncclTeamTagLsa{}, blockIdx.x, false};
-    barrier.sync(ncclCoopCta(), cuda::memory_order_acquire);
   } else {
     ncclBarrierSession<ncclCoopCta> barrier{
         ncclCoopCta(), ncclTeamTagWorld(), gin, blockIdx.x};
@@ -330,18 +327,22 @@ __global__ void wait_and_scatter(
   (void)stage;
 
   if constexpr (kCreditPipeline) {
+    // The credit protects this CTA's inbox shard, so all CTA threads must
+    // finish their scatter reads before thread 0 returns it.
+    __syncthreads();
+    const ncclGinSignal_t credit_signal = static_cast<ncclGinSignal_t>(
+        (2 + stage) * static_cast<int>(gridDim.x) + blockIdx.x);
+    // TODO: Thread 0 must return one credit per completed incoming route with
+    // gin.signal(rail, 1 - rail.rank,
+    //            ncclGin_WeakSignalAdd{credit_signal, incoming_routes}, ...).
+    // The following LSA barrier still completes every same-domain final write;
+    // issuing the credit before it lets the peer start reusing this inbox stage.
+    (void)credit_signal;
+    (void)incoming_routes;
     ncclLsaBarrierSession<ncclCoopCta> local_done{
         ncclCoopCta(), dev_comm, ncclTeamTagLsa{}, blockIdx.x, false};
     local_done.sync(ncclCoopCta(), cuda::memory_order_acq_rel);
-    const ncclGinSignal_t credit_signal = static_cast<ncclGinSignal_t>(
-        (2 + stage) * static_cast<int>(gridDim.x) + blockIdx.x);
-    // TODO: After the local LSA completion barrier, thread 0 must return one
-    // credit per completed incoming route with
-    // gin.signal(rail, 1 - rail.rank,
-    //            ncclGin_WeakSignalAdd{credit_signal, incoming_routes}, ...).
-    // Flush after that signal so the source can safely reuse this stage.
-    (void)credit_signal;
-    (void)incoming_routes;
+    // Flush after the barrier so all local source completion work is done.
     gin.flush(ncclCoopCta());
   } else if constexpr (kAsyncFlush) {
     gin.wait(flush_request, ncclCoopCta());

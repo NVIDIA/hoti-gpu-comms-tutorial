@@ -175,9 +175,6 @@ __global__ void send_and_deliver_local(
       gin.waitSignal(ncclCoopCta(), credit_signal,
                      completed_rounds * outgoing_routes);
     }
-    ncclLsaBarrierSession<ncclCoopCta> barrier{
-        ncclCoopCta(), dev_comm, ncclTeamTagLsa{}, blockIdx.x, false};
-    barrier.sync(ncclCoopCta(), cuda::memory_order_acquire);
   } else {
     ncclBarrierSession<ncclCoopCta> barrier{
         ncclCoopCta(), ncclTeamTagWorld(), gin, blockIdx.x};
@@ -355,13 +352,9 @@ __global__ void wait_and_scatter(
     }
   }
   if constexpr (kCreditPipeline) {
-    ncclLsaBarrierSession<ncclCoopCta> local_done{
-        ncclCoopCta(), dev_comm, ncclTeamTagLsa{}, blockIdx.x, false};
-    local_done.sync(ncclCoopCta(), cuda::memory_order_acq_rel);
-    if constexpr (kProfileCycles) {
-      if (threadIdx.x == 0)
-        block_traces[blockIdx.x].first_finish_end = clock64();
-    }
+    // A returned credit only protects this CTA's inbox shard. All threads
+    // must finish reading it before thread 0 lets the peer reuse that stage.
+    __syncthreads();
     if (threadIdx.x == 0 && incoming_routes != 0) {
       const ncclGinSignal_t credit_signal = static_cast<ncclGinSignal_t>(
           (2 + stage) * static_cast<int>(gridDim.x) + blockIdx.x);
@@ -370,7 +363,16 @@ __global__ void wait_and_scatter(
                  ncclCoopThread{}, ncclGin_None{},
                  cuda::thread_scope_thread, cuda::thread_scope_system);
     }
-    __syncthreads();
+    // The LSA barrier still establishes full collective completion for the
+    // direct same-domain and ingress scatter writes. It can now overlap the
+    // remote peer's next-stage credit wait.
+    ncclLsaBarrierSession<ncclCoopCta> local_done{
+        ncclCoopCta(), dev_comm, ncclTeamTagLsa{}, blockIdx.x, false};
+    local_done.sync(ncclCoopCta(), cuda::memory_order_acq_rel);
+    if constexpr (kProfileCycles) {
+      if (threadIdx.x == 0)
+        block_traces[blockIdx.x].first_finish_end = clock64();
+    }
     // This covers both the original outbound puts and the just-issued credit.
     gin.flush(ncclCoopCta());
   } else if constexpr (kAsyncFlush) {
@@ -665,10 +667,10 @@ void report_completion_trace_timing(
                       : use_credit_pipeline ? "plan + slot data wait"
                                             : "plan + signal wait";
   const char *first_finish_label =
-      use_credit_pipeline ? "LSA completion barrier"
+      use_credit_pipeline ? "credit launch + LSA completion barrier"
                           : use_async_flush ? "GIN flush wait" : "GIN flush";
   const char *second_finish_label =
-      use_credit_pipeline ? "credit signal + GIN flush" : "world barrier";
+      use_credit_pipeline ? "GIN flush" : "world barrier";
   std::printf(
       "%s completion trace: %.3f ms/iteration %s (%.1f%%), %.3f "
       "ms/iteration LSA scatter (%.1f%%), %.3f ms/iteration %s "
