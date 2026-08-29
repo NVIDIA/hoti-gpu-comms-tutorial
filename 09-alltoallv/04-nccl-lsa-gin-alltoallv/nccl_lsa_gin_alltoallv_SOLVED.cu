@@ -114,7 +114,7 @@ __device__ void scatter_assigned_shards(
   }
 }
 
-template <bool kCreditPipeline>
+template <bool kCreditPipeline, bool kStrongDataSignals>
 __global__ void send_and_deliver_local(
     ncclDevComm dev_comm, ncclWindow_t send_window,
     ncclWindow_t recv_window, ncclWindow_t plan_window,
@@ -122,6 +122,7 @@ __global__ void send_and_deliver_local(
     std::size_t domain_bytes, std::size_t stage_bytes, int route_shards,
     int network_issuers, std::uint64_t epoch) {
 #if __CUDA_ARCH__ >= 700
+  static_assert(!kStrongDataSignals || kCreditPipeline);
   const int context_count =
       min(static_cast<int>(gridDim.x),
           static_cast<int>(dev_comm.ginContextCount));
@@ -231,16 +232,34 @@ __global__ void send_and_deliver_local(
             static_cast<std::size_t>(stage) * stage_bytes +
             rail.rank * domain_bytes + destination_local * slot_bytes +
             (offset + issuer_offset) * sizeof(value_type);
-        gin.put(rail, destination_domain, inbox_window, inbox_offset,
-                send_window,
-                (entry.send_offset + offset + issuer_offset) *
-                    sizeof(value_type),
-                issuer_count * sizeof(value_type),
-                ncclGin_WeakSignalInc{data_signal});
+        if constexpr (kStrongDataSignals) {
+          gin.put(rail, destination_domain, inbox_window, inbox_offset,
+                  send_window,
+                  (entry.send_offset + offset + issuer_offset) *
+                      sizeof(value_type),
+                  issuer_count * sizeof(value_type), ncclGin_None{});
+        } else {
+          gin.put(rail, destination_domain, inbox_window, inbox_offset,
+                  send_window,
+                  (entry.send_offset + offset + issuer_offset) *
+                      sizeof(value_type),
+                  issuer_count * sizeof(value_type),
+                  ncclGin_WeakSignalInc{data_signal});
+        }
       }
     }
   }
   __syncthreads();
+  if constexpr (kStrongDataSignals) {
+    // All issuer threads have posted their same-context puts. One terminal
+    // strong signal settles them for the sole remote rail peer.
+    if (threadIdx.x == 0) {
+      gin.signal(rail, 1 - rail.rank,
+                 ncclGin_StrongSignalInc{data_signal}, ncclCoopThread{},
+                 ncclGin_None{}, cuda::thread_scope_thread,
+                 cuda::thread_scope_system);
+    }
+  }
 #endif
 }
 
@@ -258,7 +277,8 @@ struct CompletionWarpTrace {
 
 constexpr int kWarpThreads = 32;
 
-template <bool kProfileCycles, bool kAsyncFlush, bool kCreditPipeline>
+template <bool kProfileCycles, bool kAsyncFlush, bool kCreditPipeline,
+          bool kStrongDataSignals>
 __global__ void wait_and_scatter(
     ncclDevComm dev_comm, ncclWindow_t recv_window,
     ncclWindow_t plan_window, ncclWindow_t inbox_window,
@@ -267,6 +287,7 @@ __global__ void wait_and_scatter(
     std::uint64_t epoch,
     CompletionBlockTrace *block_traces, CompletionWarpTrace *warp_traces) {
 #if __CUDA_ARCH__ >= 700
+  static_assert(!kStrongDataSignals || kCreditPipeline);
   const int context_count =
       min(static_cast<int>(gridDim.x),
           static_cast<int>(dev_comm.ginContextCount));
@@ -314,20 +335,26 @@ __global__ void wait_and_scatter(
         std::uint64_t count = 0;
         shard_slice(entry.recv_count, shard, route_shards, &offset, &count);
         incoming_routes += count != 0;
-        for (int issuer = 0; issuer < network_issuers; ++issuer) {
-          std::uint64_t issuer_offset = 0;
-          std::uint64_t issuer_count = 0;
-          shard_slice(count, issuer, network_issuers, &issuer_offset,
-                      &issuer_count);
-          expected += issuer_count != 0;
+        if constexpr (!kStrongDataSignals) {
+          for (int issuer = 0; issuer < network_issuers; ++issuer) {
+            std::uint64_t issuer_offset = 0;
+            std::uint64_t issuer_count = 0;
+            shard_slice(count, issuer, network_issuers, &issuer_offset,
+                        &issuer_count);
+            expected += issuer_count != 0;
+          }
         }
       }
     }
   }
   __syncthreads();
-  if (expected != 0) {
-    const std::uint64_t data_round =
-        kCreditPipeline ? (epoch + 1) / 2 : epoch;
+  const std::uint64_t data_round =
+      kCreditPipeline ? (epoch + 1) / 2 : epoch;
+  if constexpr (kStrongDataSignals) {
+    // The sender emits one terminal signal for every CTA, including empty
+    // routes, so the stage-local threshold is exactly one per round.
+    gin.waitSignal(ncclCoopCta(), data_signal, data_round);
+  } else if (expected != 0) {
     gin.waitSignal(ncclCoopCta(), data_signal, data_round * expected);
   }
   if constexpr (kProfileCycles) {
@@ -365,7 +392,7 @@ __global__ void wait_and_scatter(
     }
     // The LSA barrier still establishes full collective completion for the
     // direct same-domain and ingress scatter writes. It can now overlap the
-    // remote peer's next-stage credit wait.
+    // remote peer's next-stage send and inbox reuse.
     ncclLsaBarrierSession<ncclCoopCta> local_done{
         ncclCoopCta(), dev_comm, ncclTeamTagLsa{}, blockIdx.x, false};
     local_done.sync(ncclCoopCta(), cuda::memory_order_acq_rel);
@@ -403,12 +430,12 @@ __global__ void wait_and_scatter(
 #endif
 }
 
-template <bool kCreditPipeline>
+template <bool kCreditPipeline, bool kStrongDataSignals>
 void launch_send_and_deliver_local_impl(
     const alltoallv::nccl_setup::State &state,
     const alltoallv::Options &options, int route_shards,
     std::uint64_t epoch) {
-  send_and_deliver_local<kCreditPipeline>
+  send_and_deliver_local<kCreditPipeline, kStrongDataSignals>
       <<<options.blocks, options.threads, 0, state.stream>>>(
       state.dev_comm, state.send_window, state.recv_window,
       state.plan_window, state.inbox_window, state.hybrid_slot_bytes,
@@ -421,21 +448,29 @@ void launch_send_and_deliver_local(const alltoallv::nccl_setup::State &state,
                                    const alltoallv::Options &options,
                                    int route_shards, std::uint64_t epoch) {
   if (alltoallv::nccl_setup::uses_two_rail_credit_pipeline(state, options)) {
-    launch_send_and_deliver_local_impl<true>(state, options, route_shards,
-                                             epoch);
+    if (alltoallv::nccl_setup::uses_two_rail_strong_data_signals(state,
+                                                                   options)) {
+      launch_send_and_deliver_local_impl<true, true>(
+          state, options, route_shards, epoch);
+    } else {
+      launch_send_and_deliver_local_impl<true, false>(
+          state, options, route_shards, epoch);
+    }
   } else {
-    launch_send_and_deliver_local_impl<false>(state, options, route_shards,
-                                              epoch);
+    launch_send_and_deliver_local_impl<false, false>(
+        state, options, route_shards, epoch);
   }
 }
 
-template <bool kProfileCycles, bool kAsyncFlush, bool kCreditPipeline>
+template <bool kProfileCycles, bool kAsyncFlush, bool kCreditPipeline,
+          bool kStrongDataSignals>
 void launch_wait_and_scatter_impl(
     const alltoallv::nccl_setup::State &state,
     const alltoallv::Options &options, int route_shards,
     std::uint64_t epoch, CompletionBlockTrace *block_traces,
     CompletionWarpTrace *warp_traces) {
-  wait_and_scatter<kProfileCycles, kAsyncFlush, kCreditPipeline>
+  wait_and_scatter<kProfileCycles, kAsyncFlush, kCreditPipeline,
+                   kStrongDataSignals>
       <<<options.blocks, options.threads, 0, state.stream>>>(
       state.dev_comm, state.recv_window, state.plan_window,
       state.inbox_window, state.hybrid_slot_bytes,
@@ -448,14 +483,20 @@ void launch_wait_and_scatter(const alltoallv::nccl_setup::State &state,
                              const alltoallv::Options &options,
                              int route_shards, std::uint64_t epoch) {
   if (alltoallv::nccl_setup::uses_two_rail_credit_pipeline(state, options)) {
-    launch_wait_and_scatter_impl<false, false, true>(
-        state, options, route_shards, epoch, nullptr, nullptr);
+    if (alltoallv::nccl_setup::uses_two_rail_strong_data_signals(state,
+                                                                   options)) {
+      launch_wait_and_scatter_impl<false, false, true, true>(
+          state, options, route_shards, epoch, nullptr, nullptr);
+    } else {
+      launch_wait_and_scatter_impl<false, false, true, false>(
+          state, options, route_shards, epoch, nullptr, nullptr);
+    }
   } else if (options.async_flush &&
       alltoallv::nccl_setup::supports_two_rail_async_flush(state)) {
-    launch_wait_and_scatter_impl<false, true, false>(
+    launch_wait_and_scatter_impl<false, true, false, false>(
         state, options, route_shards, epoch, nullptr, nullptr);
   } else {
-    launch_wait_and_scatter_impl<false, false, false>(
+    launch_wait_and_scatter_impl<false, false, false, false>(
         state, options, route_shards, epoch, nullptr, nullptr);
   }
 }
@@ -466,14 +507,20 @@ void launch_profiled_wait_and_scatter(
     std::uint64_t epoch, CompletionBlockTrace *block_traces,
     CompletionWarpTrace *warp_traces) {
   if (alltoallv::nccl_setup::uses_two_rail_credit_pipeline(state, options)) {
-    launch_wait_and_scatter_impl<true, false, true>(
-        state, options, route_shards, epoch, block_traces, warp_traces);
+    if (alltoallv::nccl_setup::uses_two_rail_strong_data_signals(state,
+                                                                   options)) {
+      launch_wait_and_scatter_impl<true, false, true, true>(
+          state, options, route_shards, epoch, block_traces, warp_traces);
+    } else {
+      launch_wait_and_scatter_impl<true, false, true, false>(
+          state, options, route_shards, epoch, block_traces, warp_traces);
+    }
   } else if (options.async_flush &&
       alltoallv::nccl_setup::supports_two_rail_async_flush(state)) {
-    launch_wait_and_scatter_impl<true, true, false>(
+    launch_wait_and_scatter_impl<true, true, false, false>(
         state, options, route_shards, epoch, block_traces, warp_traces);
   } else {
-    launch_wait_and_scatter_impl<true, false, false>(
+    launch_wait_and_scatter_impl<true, false, false, false>(
         state, options, route_shards, epoch, block_traces, warp_traces);
   }
 }
@@ -659,13 +706,19 @@ void report_completion_trace_timing(
       total_ms == 0.0f ? 0.0f : 100.0f * critical_phase_ms[3] / total_ms;
   const bool use_credit_pipeline =
       alltoallv::nccl_setup::uses_two_rail_credit_pipeline(state, options);
+  const bool use_strong_data_signals =
+      alltoallv::nccl_setup::uses_two_rail_strong_data_signals(state,
+                                                                 options);
   const bool use_async_flush =
       options.async_flush &&
       alltoallv::nccl_setup::supports_two_rail_async_flush(state);
-  const char *wait_label =
-      use_async_flush ? "async flush start + plan + signal wait"
-                      : use_credit_pipeline ? "plan + slot data wait"
-                                            : "plan + signal wait";
+  const char *wait_label = "plan + signal wait";
+  if (use_async_flush)
+    wait_label = "async flush start + plan + signal wait";
+  else if (use_strong_data_signals)
+    wait_label = "plan + terminal strong-signal wait";
+  else if (use_credit_pipeline)
+    wait_label = "plan + slot data wait";
   const char *first_finish_label =
       use_credit_pipeline ? "credit launch + LSA completion barrier"
                           : use_async_flush ? "GIN flush wait" : "GIN flush";
@@ -735,6 +788,9 @@ int main(int argc, char **argv) {
       alltoallv::nccl_setup::supports_two_rail_async_flush(state);
   const bool use_credit_pipeline =
       alltoallv::nccl_setup::uses_two_rail_credit_pipeline(state, options);
+  const bool use_strong_data_signals =
+      alltoallv::nccl_setup::uses_two_rail_strong_data_signals(state,
+                                                                 options);
   if (state.rank == 0) {
     std::printf(
         "NCCL hybrid routing: %d shard(s) per remote route, %d issuer(s) "
@@ -750,10 +806,21 @@ int main(int argc, char **argv) {
       std::printf(
           "NCCL hybrid completion: two inbox stages, per-slot credits, and "
           "LSA barriers (world barrier disabled)\n");
+      if (use_strong_data_signals) {
+        std::printf(
+            "NCCL hybrid completion: terminal strong data signals are active "
+            "(one per CTA and inbox stage)\n");
+      }
     } else if (options.credit_pipeline) {
       std::printf(
           "NCCL hybrid completion: --credit-pipeline needs exactly two rail "
           "ranks; using the world barrier\n");
+    }
+    if (options.strong_data_signals && !use_strong_data_signals) {
+      std::printf(
+          "NCCL hybrid completion: --strong-data-signals needs two rail "
+          "ranks and a backend with strong GIN signals; using weak data "
+          "signals\n");
     }
   }
   std::uint64_t epoch = 1;

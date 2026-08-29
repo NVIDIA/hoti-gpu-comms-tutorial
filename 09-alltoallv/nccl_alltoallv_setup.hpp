@@ -120,6 +120,28 @@ inline bool uses_two_rail_credit_pipeline(const State &state,
   return options.credit_pipeline && state.rail_team.nRanks == 2;
 }
 
+inline bool supports_two_rail_strong_data_signals(const State &state) {
+  if (state.rail_team.nRanks != 2)
+    return false;
+  // NCCL 2.31.2 reports strong GIN signals for these railed backends. EFA
+  // GDA does not provide that capability, so retain weak data signals there.
+  switch (state.railed_gin_type) {
+  case NCCL_GIN_TYPE_PROXY:
+  case NCCL_GIN_TYPE_GDAKI:
+  case NCCL_GIN_TYPE_GPI:
+    return true;
+  default:
+    return false;
+  }
+}
+
+inline bool uses_two_rail_strong_data_signals(const State &state,
+                                              const Options &options) {
+  return uses_two_rail_credit_pipeline(state, options) &&
+         options.strong_data_signals &&
+         supports_two_rail_strong_data_signals(state);
+}
+
 inline void finish(State *state) {
   if (state->dev_comm_created) {
     ALLTOALLV_NCCL_CHECK(ncclDevCommDestroy(state->comm, &state->dev_comm));
@@ -369,6 +391,9 @@ inline SetupResult prepare(State *state, int *argc, char ***argv,
   const bool use_credit_pipeline =
       backend == Backend::HybridRail &&
       uses_two_rail_credit_pipeline(*state, *options);
+  const bool use_strong_data_signals =
+      backend == Backend::HybridRail &&
+      uses_two_rail_strong_data_signals(*state, *options);
 
   state->send_bytes = std::max<std::size_t>(
       1, plan->global_send_capacity * sizeof(value_type));
@@ -452,7 +477,7 @@ inline SetupResult prepare(State *state, int *argc, char ***argv,
     requirements.ginSignalCount = requested_gin_signals;
     requirements.ginQueueDepth = options->gin_queue_depth;
     requirements.ginConnectionType = NCCL_GIN_CONNECTION_RAIL;
-    requirements.ginStrongSignalsRequired = false;
+    requirements.ginStrongSignalsRequired = use_strong_data_signals;
     requirements.ginVaSignalsRequired = false;
   }
   ALLTOALLV_NCCL_CHECK(

@@ -122,16 +122,20 @@ run, not a headline-performance run: it records three CUDA events per
 iteration so the two sequential stages can be tuned independently.
 
 The LSA + railed-GIN exercise additionally accepts `--network-issuers N`,
-`--async-flush`, and `--credit-pipeline`. `--async-flush` is a two-rail
-source-completion overlap experiment: it begins the peer-specific flush before
-receive work, waits for its request before the final reuse barrier, and
-otherwise falls back to a synchronous flush. `--credit-pipeline` is a separate
-two-rail experiment: it double-buffers the network inbox, uses separate
-per-slot data and credit signals, and replaces the cross-domain world barrier
-with an LSA barrier plus returned credits. It requests four GIN signal IDs per
-CTA and doubles the inbox allocation, so start with the default world-barrier
-path. The two experiments are mutually exclusive. The other exercises reject
-these hybrid-only controls.
+`--async-flush`, `--credit-pipeline`, and `--strong-data-signals`.
+`--async-flush` is a two-rail source-completion overlap experiment: it begins
+the peer-specific flush before receive work, waits for its request before the
+final reuse barrier, and otherwise falls back to a synchronous flush.
+`--credit-pipeline` is a separate two-rail experiment: it double-buffers the
+network inbox, uses separate per-slot data and credit signals, and replaces the
+cross-domain world barrier with an LSA barrier plus returned credits. It
+requests four GIN signal IDs per CTA and doubles the inbox allocation, so start
+with the default world-barrier path. `--strong-data-signals` requires that
+credit path and a backend with strong GIN signals; it replaces the per-put weak
+data notifications with one terminal strong signal per CTA. It is mainly a
+high-fanout or multi-issuer experiment, not a default. The async and credit
+experiments are mutually exclusive. The other exercises reject these
+hybrid-only controls.
 
 The programs first validate one iteration, then time warm and measured
 iterations. The output separates self, same-domain, and cross-domain bytes.

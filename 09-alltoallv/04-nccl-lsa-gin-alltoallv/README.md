@@ -50,7 +50,9 @@ The default implementation has one such inbox stage. The optional
 `--credit-pipeline` path allocates two complete stages and uses the epoch
 parity to select one. That keeps an early next-epoch put out of the slot the
 receiver is still scattering; the sender waits for a returned credit before it
-reuses the same stage.
+reuses the same stage. Its optional `--strong-data-signals` variant keeps the
+same stages and credits but changes only how a CTA announces that its data is
+ready.
 
 Large messages are divided into shards inside that slot. Shard boundaries are
 16-byte aligned, and the last shard owns any scalar tail. The host aims for
@@ -160,6 +162,26 @@ This lets a CTA post several independent GIN work requests without changing
 the inbox layout, signal IDs, or reuse protocol. Start with `N=1`; tune it
 only after the default has passed correctness checks on the target topology.
 
+`--strong-data-signals` is an opt-in alternative for the two-rail credit path.
+Every data put uses `ncclGin_None`, then after all issuer threads synchronize,
+thread 0 sends one zero-byte `ncclGin_StrongSignalInc` to the sole remote rail
+peer. The receiver waits for exactly one cumulative terminal signal per
+stage-round, including when its CTA has no payload. This is important: a CTA
+with an empty route still sends the terminal signal, so the sender and receiver
+do not make different wait decisions. A strong signal settles preceding puts
+only on its same GIN context and to its same peer. The two-rail mapping gives
+the matched sender and receiver CTAs precisely that context/peer relationship;
+the option is therefore not a general multi-rail aggregation protocol.
+
+The terminal signal replaces the weak data increments; it must not supplement
+or share their signal slot. Credit `WeakSignalAdd` operations remain on the
+disjoint credit ranges. The setup requests `ginStrongSignalsRequired` only when
+this path is active, because NCCL defines use of a strong signal without that
+resource as undefined. The tutorial enables it only on exactly two rails and
+backends that advertise strong signals (the validated GB300 GDAKI path does).
+It commonly loses for one small issuer slice, but can reduce notification work
+when a CTA has many sharded, multi-issuer puts.
+
 `--async-flush` is a deliberately narrow two-rail experiment. Each CTA starts
 a peer-scoped `gin.flushAsync` for its one remote rail peer before waiting for
 incoming signals, scatters the received shards, then calls `gin.wait` on that
@@ -173,14 +195,18 @@ peer. The validated GB300 configuration reports `railed GIN=GDAKI`.
 combined with `--async-flush`. It replaces the cross-domain world barrier with
 two inbox stages and a credit-return protocol. For CTA `b` and stage `s`, the
 data signal is `s * blocks + b` and the credit signal is
-`(2 + s) * blocks + b`; data uses `ncclGin_WeakSignalInc`, while credits use
-`ncclGin_WeakSignalAdd`. They must not share a signal because NCCL does not
-permit mixing increment and add operations without resetting the signal.
+`(2 + s) * blocks + b`; the normal data path uses
+`ncclGin_WeakSignalInc`, while credits use `ncclGin_WeakSignalAdd`.
+`--strong-data-signals` replaces the normal data increments with one terminal
+`ncclGin_StrongSignalInc` on the same data signal. Data and credits must not
+share a signal because NCCL does not permit mixing increment and add operations
+without resetting the signal.
 
 With epochs starting at one, `stage = (epoch - 1) & 1` and
-`round = (epoch + 1) / 2`. The receiver waits for
-`round * incoming_nonempty_issuer_slices` on that stage's data signal. Before
-the sender reuses a stage, it waits for
+`round = (epoch + 1) / 2`. The normal receiver waits for
+`round * incoming_nonempty_issuer_slices` on that stage's data signal; the
+strong-data variant waits for `round` because it has exactly one terminal
+signal per CTA. Before the sender reuses a stage, it waits for
 `(round - 1) * outgoing_nonempty_route_shards` on the matching credit signal.
 The first use of each stage needs no credit. On the receiving CTA, the order is
 data wait, LSA scatter, a CTA synchronization, then one zero-byte GIN
@@ -199,14 +225,15 @@ four signal IDs per CTA, so correctness and memory headroom come before any
 throughput comparison.
 
 The weak signal makes its own inbox shard visible before the receiver observes
-the increment. It does not make the sender's source range safe to reuse;
-`gin.flush` (or the matching `gin.wait` after `--async-flush`) provides that
-local completion guarantee. The completion work is delayed until the second
-kernel so outgoing puts can remain in flight while the CTA waits for and
-scatters incoming data. In the default path, the final world barrier runs after
-every CTA has completed its outgoing context and LSA scatter. The next launch
-can then reuse the send buffer and inbox slots; the credit path instead uses
-its per-slot acknowledgements to establish that reuse condition.
+the increment; the terminal strong signal provides the corresponding guarantee
+for its preceding same-context puts. Neither makes the sender's source range
+safe to reuse; `gin.flush` (or the matching `gin.wait` after `--async-flush`)
+provides that local completion guarantee. The completion work is delayed until
+the second kernel so outgoing puts can remain in flight while the CTA waits for
+and scatters incoming data. In the default path, the final world barrier runs
+after every CTA has completed its outgoing context and LSA scatter. The next
+launch can then reuse the send buffer and inbox slots; the credit path instead
+uses its per-slot acknowledgements to establish that reuse condition.
 
 The main device APIs are:
 
@@ -307,7 +334,10 @@ On a topology with exactly two rail ranks, compare either candidate with the
 same normal (non-profiled) workload by adding `--async-flush` or
 `--credit-pipeline`. Keep the default synchronous world-barrier mode as the
 baseline; a profile is for locating tail work, not for reporting throughput.
-The two candidate flags are mutually exclusive.
+The two candidate flags are mutually exclusive. To evaluate terminal strong
+signals, hold the credit pipeline fixed and compare it against
+`--credit-pipeline --strong-data-signals`; start with a sharded, multi-issuer
+case such as `--pattern skewed --network-issuers 4`, not a single-slice route.
 
 The additional line reports `send + local delivery` separately from `wait +
 scatter + flush`. Use it to choose the next algorithmic experiment, then turn
@@ -322,7 +352,8 @@ rather than as a standalone throughput number.
 With `--async-flush`, the trace labels the asynchronous flush start with the
 first phase and its later completion wait with the flush phase. With
 `--credit-pipeline`, the final two labels instead show the LSA completion
-barrier (including the early credit launch) and the GIN flush.
+barrier (including the early credit launch) and the GIN flush. With terminal
+strong signals, the first label explicitly identifies the terminal-signal wait.
 
 CTA count affects both the LSA copy and the requested GIN-context count. Start
 with the default for small messages. On the Lyris placement above, start

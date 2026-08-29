@@ -113,7 +113,7 @@ __device__ void scatter_assigned_shards(
   }
 }
 
-template <bool kCreditPipeline>
+template <bool kCreditPipeline, bool kStrongDataSignals>
 __global__ void send_and_deliver_local(
     ncclDevComm dev_comm, ncclWindow_t send_window,
     ncclWindow_t recv_window, ncclWindow_t plan_window,
@@ -121,6 +121,7 @@ __global__ void send_and_deliver_local(
     std::size_t domain_bytes, std::size_t stage_bytes, int route_shards,
     int network_issuers, std::uint64_t epoch) {
 #if __CUDA_ARCH__ >= 700
+  static_assert(!kStrongDataSignals || kCreditPipeline);
   const int context_count =
       min(static_cast<int>(gridDim.x),
           static_cast<int>(dev_comm.ginContextCount));
@@ -238,18 +239,26 @@ __global__ void send_and_deliver_local(
             (offset + issuer_offset) * sizeof(value_type);
 
         // TODO: Put this issuer slice into inbox_offset on destination_domain.
-        // Attach ncclGin_WeakSignalInc{data_signal}; stage-separated data
-        // signals let each inbox stage accumulate independently.
+        // In the default path attach ncclGin_WeakSignalInc{data_signal}.
+        // With kStrongDataSignals, attach ncclGin_None{} here and have
+        // thread 0 issue one terminal ncclGin_StrongSignalInc{data_signal}
+        // after the CTA synchronization below.
         (void)inbox_offset;
         (void)issuer_count;
       }
     }
   }
   __syncthreads();
+  if constexpr (kStrongDataSignals) {
+    // TODO: Thread 0 must signal the sole remote rail peer with
+    // ncclGin_StrongSignalInc{data_signal}. Every issuer thread has reached
+    // this point, so that signal can settle all of this CTA's prior puts.
+    (void)data_signal;
+  }
 #endif
 }
 
-template <bool kAsyncFlush, bool kCreditPipeline>
+template <bool kAsyncFlush, bool kCreditPipeline, bool kStrongDataSignals>
 __global__ void wait_and_scatter(
     ncclDevComm dev_comm, ncclWindow_t recv_window,
     ncclWindow_t plan_window, ncclWindow_t inbox_window,
@@ -257,6 +266,7 @@ __global__ void wait_and_scatter(
     std::size_t stage_bytes, int route_shards, int network_issuers,
     std::uint64_t epoch) {
 #if __CUDA_ARCH__ >= 700
+  static_assert(!kStrongDataSignals || kCreditPipeline);
   const int context_count =
       min(static_cast<int>(gridDim.x),
           static_cast<int>(dev_comm.ginContextCount));
@@ -315,9 +325,10 @@ __global__ void wait_and_scatter(
   }
   __syncthreads();
 
-  // TODO: If expected is nonzero, wait for this CTA's signal to reach
-  // (kCreditPipeline ? (epoch + 1) / 2 : epoch) * expected on data_signal.
-  // Then call scatter_assigned_shards with stage_bytes and stage for this CTA.
+  // TODO: With kStrongDataSignals, every CTA receives one terminal signal per
+  // round (including empty routes), so wait for data_round. Otherwise, if
+  // expected is nonzero, wait for data_round * expected. Then call
+  // scatter_assigned_shards with stage_bytes and stage for this CTA.
   const std::uint64_t data_round =
       kCreditPipeline ? (epoch + 1) / 2 : epoch;
   (void)expected;
@@ -358,12 +369,12 @@ __global__ void wait_and_scatter(
 #endif
 }
 
-template <bool kCreditPipeline>
+template <bool kCreditPipeline, bool kStrongDataSignals>
 void launch_send_and_deliver_local_impl(
     const alltoallv::nccl_setup::State &state,
     const alltoallv::Options &options, int route_shards,
     std::uint64_t epoch) {
-  send_and_deliver_local<kCreditPipeline>
+  send_and_deliver_local<kCreditPipeline, kStrongDataSignals>
       <<<options.blocks, options.threads, 0, state.stream>>>(
       state.dev_comm, state.send_window, state.recv_window,
       state.plan_window, state.inbox_window, state.hybrid_slot_bytes,
@@ -376,20 +387,26 @@ void launch_send_and_deliver_local(const alltoallv::nccl_setup::State &state,
                                    const alltoallv::Options &options,
                                    int route_shards, std::uint64_t epoch) {
   if (alltoallv::nccl_setup::uses_two_rail_credit_pipeline(state, options)) {
-    launch_send_and_deliver_local_impl<true>(state, options, route_shards,
-                                             epoch);
+    if (alltoallv::nccl_setup::uses_two_rail_strong_data_signals(state,
+                                                                   options)) {
+      launch_send_and_deliver_local_impl<true, true>(
+          state, options, route_shards, epoch);
+    } else {
+      launch_send_and_deliver_local_impl<true, false>(
+          state, options, route_shards, epoch);
+    }
   } else {
-    launch_send_and_deliver_local_impl<false>(state, options, route_shards,
-                                              epoch);
+    launch_send_and_deliver_local_impl<false, false>(
+        state, options, route_shards, epoch);
   }
 }
 
-template <bool kAsyncFlush, bool kCreditPipeline>
+template <bool kAsyncFlush, bool kCreditPipeline, bool kStrongDataSignals>
 void launch_wait_and_scatter_impl(
     const alltoallv::nccl_setup::State &state,
     const alltoallv::Options &options, int route_shards,
     std::uint64_t epoch) {
-  wait_and_scatter<kAsyncFlush, kCreditPipeline>
+  wait_and_scatter<kAsyncFlush, kCreditPipeline, kStrongDataSignals>
       <<<options.blocks, options.threads, 0, state.stream>>>(
       state.dev_comm, state.recv_window, state.plan_window,
       state.inbox_window, state.hybrid_slot_bytes,
@@ -402,15 +419,21 @@ void launch_wait_and_scatter(const alltoallv::nccl_setup::State &state,
                              const alltoallv::Options &options,
                              int route_shards, std::uint64_t epoch) {
   if (alltoallv::nccl_setup::uses_two_rail_credit_pipeline(state, options)) {
-    launch_wait_and_scatter_impl<false, true>(state, options, route_shards,
-                                              epoch);
+    if (alltoallv::nccl_setup::uses_two_rail_strong_data_signals(state,
+                                                                   options)) {
+      launch_wait_and_scatter_impl<false, true, true>(
+          state, options, route_shards, epoch);
+    } else {
+      launch_wait_and_scatter_impl<false, true, false>(
+          state, options, route_shards, epoch);
+    }
   } else if (options.async_flush &&
       alltoallv::nccl_setup::supports_two_rail_async_flush(state)) {
-    launch_wait_and_scatter_impl<true, false>(state, options, route_shards,
-                                              epoch);
+    launch_wait_and_scatter_impl<true, false, false>(
+        state, options, route_shards, epoch);
   } else {
-    launch_wait_and_scatter_impl<false, false>(state, options, route_shards,
-                                               epoch);
+    launch_wait_and_scatter_impl<false, false, false>(
+        state, options, route_shards, epoch);
   }
 }
 
@@ -515,6 +538,9 @@ int main(int argc, char **argv) {
       alltoallv::nccl_setup::supports_two_rail_async_flush(state);
   const bool use_credit_pipeline =
       alltoallv::nccl_setup::uses_two_rail_credit_pipeline(state, options);
+  const bool use_strong_data_signals =
+      alltoallv::nccl_setup::uses_two_rail_strong_data_signals(state,
+                                                                 options);
   if (state.rank == 0) {
     std::printf(
         "NCCL hybrid routing: %d shard(s) per remote route, %d issuer(s) "
@@ -530,10 +556,21 @@ int main(int argc, char **argv) {
       std::printf(
           "NCCL hybrid completion: two inbox stages, per-slot credits, and "
           "LSA barriers (world barrier disabled)\n");
+      if (use_strong_data_signals) {
+        std::printf(
+            "NCCL hybrid completion: terminal strong data signals are active "
+            "(one per CTA and inbox stage)\n");
+      }
     } else if (options.credit_pipeline) {
       std::printf(
           "NCCL hybrid completion: --credit-pipeline needs exactly two rail "
           "ranks; using the world barrier\n");
+    }
+    if (options.strong_data_signals && !use_strong_data_signals) {
+      std::printf(
+          "NCCL hybrid completion: --strong-data-signals needs two rail "
+          "ranks and a backend with strong GIN signals; using weak data "
+          "signals\n");
     }
   }
   std::uint64_t epoch = 1;
