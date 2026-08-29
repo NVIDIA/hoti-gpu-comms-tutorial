@@ -200,6 +200,7 @@ __global__ void send_and_deliver_local(
 struct CompletionBlockTrace {
   std::uint64_t wait_begin;
   std::uint64_t wait_end;
+  std::uint64_t flush_end;
   std::uint64_t finish_end;
 };
 
@@ -301,6 +302,10 @@ __global__ void wait_and_scatter(
   } else {
     gin.flush(ncclCoopCta());
   }
+  if constexpr (kProfileCycles) {
+    if (threadIdx.x == 0)
+      block_traces[blockIdx.x].flush_end = clock64();
+  }
 
   barrier.sync(ncclCoopCta(), cuda::memory_order_acq_rel,
                ncclGinFenceLevel::None);
@@ -377,7 +382,8 @@ struct PhaseTimes {
   float wait_and_scatter_ms = 0.0f;
   float plan_and_wait_cta_ms = 0.0f;
   float scatter_cta_ms = 0.0f;
-  float flush_and_barrier_cta_ms = 0.0f;
+  float flush_cta_ms = 0.0f;
+  float barrier_cta_ms = 0.0f;
 };
 
 PhaseTimes profile_iterations(const alltoallv::nccl_setup::State &state,
@@ -448,7 +454,8 @@ PhaseTimes profile_iterations(const alltoallv::nccl_setup::State &state,
 
   std::uint64_t plan_and_wait_cycles = 0;
   std::uint64_t scatter_cycles = 0;
-  std::uint64_t flush_and_barrier_cycles = 0;
+  std::uint64_t flush_cycles = 0;
+  std::uint64_t barrier_cycles = 0;
   for (int iteration = 0; iteration < options.iterations; ++iteration) {
     const CompletionBlockTrace *block_values =
         host_block_traces.data() + iteration * block_traces_per_iteration;
@@ -467,32 +474,35 @@ PhaseTimes profile_iterations(const alltoallv::nccl_setup::State &state,
     const CompletionBlockTrace &trace = block_values[slowest_block];
     plan_and_wait_cycles += trace.wait_end - trace.wait_begin;
 
-    std::uint64_t longest_scatter = 0;
     std::uint64_t latest_scatter_end = trace.wait_end;
     for (int warp = 0; warp < options.threads / kWarpThreads; ++warp) {
       const CompletionWarpTrace &warp_trace =
           warp_values[slowest_block * (options.threads / kWarpThreads) +
                       warp];
-      longest_scatter = std::max(
-          longest_scatter, warp_trace.scatter_end - warp_trace.scatter_begin);
       latest_scatter_end =
           std::max(latest_scatter_end, warp_trace.scatter_end);
     }
-    scatter_cycles += longest_scatter;
-    flush_and_barrier_cycles +=
-        trace.finish_end > latest_scatter_end
-            ? trace.finish_end - latest_scatter_end
-            : 0;
+    // Attribute the entire critical-CTA scatter span, including any warp
+    // scheduling skew, so the trace buckets form one elapsed-time partition.
+    scatter_cycles += latest_scatter_end - trace.wait_end;
+    flush_cycles += trace.flush_end > latest_scatter_end
+                        ? trace.flush_end - latest_scatter_end
+                        : 0;
+    barrier_cycles += trace.finish_end > trace.flush_end
+                          ? trace.finish_end - trace.flush_end
+                          : 0;
   }
   const double traced_cycles = static_cast<double>(plan_and_wait_cycles) +
-                               scatter_cycles + flush_and_barrier_cycles;
+                               scatter_cycles + flush_cycles + barrier_cycles;
   if (traced_cycles != 0.0) {
     result.plan_and_wait_cta_ms = static_cast<float>(
         result.wait_and_scatter_ms * plan_and_wait_cycles / traced_cycles);
     result.scatter_cta_ms = static_cast<float>(
         result.wait_and_scatter_ms * scatter_cycles / traced_cycles);
-    result.flush_and_barrier_cta_ms = static_cast<float>(
-        result.wait_and_scatter_ms * flush_and_barrier_cycles / traced_cycles);
+    result.flush_cta_ms = static_cast<float>(
+        result.wait_and_scatter_ms * flush_cycles / traced_cycles);
+    result.barrier_cta_ms = static_cast<float>(
+        result.wait_and_scatter_ms * barrier_cycles / traced_cycles);
   }
   return result;
 }
@@ -516,24 +526,27 @@ void report_completion_trace_timing(
       MPI_Allreduce(&local, &critical, 1, MPI_FLOAT_INT, MPI_MAXLOC,
                     MPI_COMM_WORLD),
       "MPI_Allreduce(completion trace critical rank)");
-  float critical_phase_ms[3] = {phases.plan_and_wait_cta_ms,
+  float critical_phase_ms[4] = {phases.plan_and_wait_cta_ms,
                                 phases.scatter_cta_ms,
-                                phases.flush_and_barrier_cta_ms};
+                                phases.flush_cta_ms,
+                                phases.barrier_cta_ms};
   alltoallv::mpi_check(
-      MPI_Bcast(critical_phase_ms, 3, MPI_FLOAT, critical.rank,
+      MPI_Bcast(critical_phase_ms, 4, MPI_FLOAT, critical.rank,
                 MPI_COMM_WORLD),
       "MPI_Bcast(completion trace critical phases)");
   if (rank != 0)
     return;
 
   const float total_ms = critical_phase_ms[0] + critical_phase_ms[1] +
-                         critical_phase_ms[2];
+                         critical_phase_ms[2] + critical_phase_ms[3];
   const float plan_fraction =
       total_ms == 0.0f ? 0.0f : 100.0f * critical_phase_ms[0] / total_ms;
   const float scatter_fraction =
       total_ms == 0.0f ? 0.0f : 100.0f * critical_phase_ms[1] / total_ms;
   const float flush_fraction =
       total_ms == 0.0f ? 0.0f : 100.0f * critical_phase_ms[2] / total_ms;
+  const float barrier_fraction =
+      total_ms == 0.0f ? 0.0f : 100.0f * critical_phase_ms[3] / total_ms;
   const bool use_async_flush =
       options.async_flush &&
       alltoallv::nccl_setup::supports_two_rail_async_flush(state);
@@ -541,15 +554,17 @@ void report_completion_trace_timing(
       use_async_flush ? "async flush start + plan + signal wait"
                       : "plan + signal wait";
   const char *flush_label =
-      use_async_flush ? "GIN flush wait + barrier" : "GIN flush + barrier";
+      use_async_flush ? "GIN flush wait" : "GIN flush";
   std::printf(
       "%s completion trace: %.3f ms/iteration %s (%.1f%%), %.3f "
       "ms/iteration LSA scatter (%.1f%%), %.3f ms/iteration %s "
-      "(%.1f%%; critical CTA, CUDA-event-scaled)\n",
+      "(%.1f%%), %.3f ms/iteration world barrier (%.1f%%; critical CTA, "
+      "CUDA-event-scaled)\n",
       implementation, critical_phase_ms[0] / options.iterations, wait_label,
       plan_fraction, critical_phase_ms[1] / options.iterations,
       scatter_fraction, critical_phase_ms[2] / options.iterations,
-      flush_label, flush_fraction);
+      flush_label, flush_fraction, critical_phase_ms[3] / options.iterations,
+      barrier_fraction);
 }
 
 int choose_route_shards(const alltoallv::nccl_setup::State &state,
