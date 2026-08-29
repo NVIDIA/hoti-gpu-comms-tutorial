@@ -42,6 +42,15 @@ __device__ void copy_values(const value_type *source, value_type *destination,
     destination[i] = source[i];
 }
 
+__global__ void add_send_bias(value_type *send, std::uint64_t count,
+                               value_type bias) {
+  for (std::uint64_t i =
+           static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       i < count;
+       i += static_cast<std::uint64_t>(gridDim.x) * blockDim.x)
+    send[i] += bias;
+}
+
 __device__ int route_shard_block(
     int source_domain, int destination_domain, int destination_local,
     int domain_count, int local_count, int shard, int route_shards,
@@ -444,6 +453,15 @@ void launch(const alltoallv::nccl_setup::State &state,
   launch_wait_and_scatter(state, options, route_shards, epoch);
 }
 
+void stamp_send_for_epoch_stress(const alltoallv::nccl_setup::State &state,
+                                 const alltoallv::Options &options,
+                                 const alltoallv::Plan &plan) {
+  add_send_bias<<<options.blocks, options.threads, 0, state.stream>>>(
+      static_cast<value_type *>(state.send), plan.global_send_capacity,
+      alltoallv::kEpochStressDelta);
+  ALLTOALLV_CUDA_CHECK(cudaGetLastError());
+}
+
 struct PhaseTimes {
   float send_and_deliver_ms = 0.0f;
   float wait_and_scatter_ms = 0.0f;
@@ -541,6 +559,15 @@ int main(int argc, char **argv) {
   const bool use_strong_data_signals =
       alltoallv::nccl_setup::uses_two_rail_strong_data_signals(state,
                                                                  options);
+  if (options.epoch_stress != 0 && !use_credit_pipeline) {
+    if (state.rank == 0) {
+      std::fprintf(stderr,
+                   "--epoch-stress requires an active two-rail "
+                   "--credit-pipeline\n");
+    }
+    alltoallv::nccl_setup::finish(&state);
+    return 1;
+  }
   if (state.rank == 0) {
     std::printf(
         "NCCL hybrid routing: %d shard(s) per remote route, %d issuer(s) "
@@ -571,6 +598,12 @@ int main(int argc, char **argv) {
           "NCCL hybrid completion: --strong-data-signals needs two rail "
           "ranks and a backend with strong GIN signals; using weak data "
           "signals\n");
+    }
+    if (options.epoch_stress != 0) {
+      std::printf(
+          "NCCL hybrid validation: %d changing-payload credit epoch(s) "
+          "after timing\n",
+          options.epoch_stress);
     }
   }
   std::uint64_t epoch = 1;
@@ -624,6 +657,23 @@ int main(int argc, char **argv) {
   if (errors != 0) {
     alltoallv::nccl_setup::finish(&state);
     return 1;
+  }
+
+  if (options.epoch_stress != 0) {
+    alltoallv::nccl_setup::clear_recv_for_reuse(&state);
+    value_type bias = 0;
+    for (int i = 0; i < options.epoch_stress; ++i) {
+      bias = static_cast<value_type>(bias + alltoallv::kEpochStressDelta);
+      stamp_send_for_epoch_stress(state, options, plan);
+      launch(state, options, route_shards, ++epoch);
+    }
+    ALLTOALLV_CUDA_CHECK(cudaStreamSynchronize(state.stream));
+    errors = alltoallv::nccl_setup::copy_and_validate(
+        &state, plan, "NCCL LSA + railed GIN AlltoAllV epoch stress", bias);
+    if (errors != 0) {
+      alltoallv::nccl_setup::finish(&state);
+      return 1;
+    }
   }
 
   alltoallv::nccl_setup::finish(&state);

@@ -122,7 +122,8 @@ run, not a headline-performance run: it records three CUDA events per
 iteration so the two sequential stages can be tuned independently.
 
 The LSA + railed-GIN exercise additionally accepts `--network-issuers N`,
-`--async-flush`, `--credit-pipeline`, and `--strong-data-signals`.
+`--async-flush`, `--credit-pipeline`, `--strong-data-signals`, and
+`--epoch-stress N`.
 `--async-flush` is a two-rail source-completion overlap experiment: it begins
 the peer-specific flush before receive work, waits for its request before the
 final reuse barrier, and otherwise falls back to a synchronous flush.
@@ -136,6 +137,13 @@ data notifications with one terminal strong signal per CTA. It is mainly a
 high-fanout or multi-issuer experiment, not a default. The async and credit
 experiments are mutually exclusive. The other exercises reject these
 hybrid-only controls.
+
+`--epoch-stress N` is a validation-only credit-pipeline diagnostic. After the
+timed run and ordinary reuse check, it clears the receive buffer, changes every
+rank's send-buffer values before each of `N` back-to-back epochs, and validates
+the final expected bias. It requires an active two-rail `--credit-pipeline` and
+`N >= 4`, so both inbox stages are reused; it adds no timing-loop events or
+per-epoch host synchronization.
 
 The programs first validate one iteration, then time warm and measured
 iterations. The output separates self, same-domain, and cross-domain bytes.

@@ -549,13 +549,14 @@ inline SetupResult prepare(State *state, int *argc, char ***argv,
 }
 
 inline int copy_and_validate(State *state, const Plan &plan,
-                             const char *implementation) {
+                             const char *implementation,
+                             value_type bias = 0) {
   std::vector<value_type> observed(plan.global_recv_capacity);
   ALLTOALLV_CUDA_CHECK(cudaMemcpyAsync(
       observed.data(), state->recv, state->recv_bytes, cudaMemcpyDeviceToHost,
       state->stream));
   ALLTOALLV_CUDA_CHECK(cudaStreamSynchronize(state->stream));
-  return alltoallv::validate(plan, observed, implementation);
+  return alltoallv::validate(plan, observed, implementation, bias);
 }
 
 // The reuse validation deliberately clears the receive buffer so a missing

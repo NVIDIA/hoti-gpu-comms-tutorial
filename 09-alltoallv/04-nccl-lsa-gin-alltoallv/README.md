@@ -224,6 +224,17 @@ keep the default world-barrier path. It doubles the inbox allocation and uses
 four signal IDs per CTA, so correctness and memory headroom come before any
 throughput comparison.
 
+`--epoch-stress N` is an opt-in freshness check for this active two-rail credit
+path, with `N >= 4`. It runs only after the normal timing and static reuse
+checks: after a synchronized receive clear, it adds a fixed odd bias to each
+send-buffer word and launches `N` consecutive epochs on the same stream. The
+final expected buffer carries the accumulated bias only in active receive
+ranges, so padding must remain untouched. There is intentionally no
+per-iteration host synchronization or MPI barrier; the preceding credit-path
+completion makes the source buffer safe to stamp, while stream order makes the
+stamp precede the next producer kernel. This catches a stale inbox value that
+would otherwise look correct because the default payload is static.
+
 The weak signal makes its own inbox shard visible before the receiver observes
 the increment; the terminal strong signal provides the corresponding guarantee
 for its preceding same-context puts. Neither makes the sender's source range
@@ -338,6 +349,8 @@ The two candidate flags are mutually exclusive. To evaluate terminal strong
 signals, hold the credit pipeline fixed and compare it against
 `--credit-pipeline --strong-data-signals`; start with a sharded, multi-issuer
 case such as `--pattern skewed --network-issuers 4`, not a single-slice route.
+For a changing-payload reuse check, append `--epoch-stress 4`; it is a
+validation diagnostic and is intentionally outside the reported timing.
 
 The additional line reports `send + local delivery` separately from `wait +
 scatter + flush`. Use it to choose the next algorithmic experiment, then turn

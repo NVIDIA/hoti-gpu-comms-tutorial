@@ -21,6 +21,9 @@ namespace alltoallv {
 using value_type = std::uint32_t;
 
 constexpr value_type kUntouched = 0xa5a5a5a5u;
+// An odd delta makes the optional reuse stress test produce a different
+// payload on every launch while preserving uint32_t's defined wraparound.
+constexpr value_type kEpochStressDelta = 0x1f123bb5u;
 constexpr std::uint64_t kElementsPerAlignment = 16 / sizeof(value_type);
 
 struct Options {
@@ -43,6 +46,9 @@ struct Options {
   // Replace each hybrid data-put signal with one terminal strong signal per
   // CTA. This is valid only for the two-rail credit pipeline.
   bool strong_data_signals = false;
+  // After normal validation, run this many changing-payload credit epochs.
+  // Zero disables the diagnostic; an enabled run needs at least four epochs.
+  int epoch_stress = 0;
   bool profile_phases = false;
   bool help = false;
 };
@@ -121,6 +127,7 @@ inline void print_usage(const char *program,
       program, allow_hybrid_options
                    ? "[--network-issuers N] [--async-flush] "
                      "[--credit-pipeline] [--strong-data-signals] "
+                     "[--epoch-stress N] "
                    : "");
 }
 
@@ -167,6 +174,9 @@ inline Options parse_options(int argc, char **argv, int rank,
     } else if (allow_hybrid_options &&
                std::strcmp(argv[i], "--strong-data-signals") == 0) {
       options.strong_data_signals = true;
+    } else if (allow_hybrid_options &&
+               std::strcmp(argv[i], "--epoch-stress") == 0) {
+      options.epoch_stress = std::atoi(need_value("--epoch-stress"));
     } else if (std::strcmp(argv[i], "--profile-phases") == 0) {
       options.profile_phases = true;
     } else if (std::strcmp(argv[i], "--help") == 0 ||
@@ -192,7 +202,10 @@ inline Options parse_options(int argc, char **argv, int rank,
        options.gin_queue_depth < 0 || options.network_issuers < 1 ||
        options.network_issuers > options.threads ||
        (options.async_flush && options.credit_pipeline) ||
-       (options.strong_data_signals && !options.credit_pipeline))) {
+       (options.strong_data_signals && !options.credit_pipeline) ||
+       options.epoch_stress < 0 ||
+       (options.epoch_stress != 0 &&
+        (options.epoch_stress < 4 || !options.credit_pipeline)))) {
     if (rank == 0) {
       std::fprintf(stderr, "Invalid arguments\n");
       print_usage(argv[0], allow_hybrid_options);
@@ -208,7 +221,7 @@ inline int requested_gin_contexts(const Options &options) {
 
 inline void require_matching_collective_options(const Options &options,
                                                 int rank) {
-  int values[11] = {options.blocks,
+  int values[12] = {options.blocks,
                     options.threads,
                     options.warmup,
                     options.iterations,
@@ -218,23 +231,24 @@ inline void require_matching_collective_options(const Options &options,
                     static_cast<int>(options.async_flush),
                     static_cast<int>(options.credit_pipeline),
                     static_cast<int>(options.strong_data_signals),
+                    options.epoch_stress,
                     static_cast<int>(options.profile_phases)};
-  int minima[11];
-  int maxima[11];
-  mpi_check(MPI_Allreduce(values, minima, 11, MPI_INT, MPI_MIN,
+  int minima[12];
+  int maxima[12];
+  mpi_check(MPI_Allreduce(values, minima, 12, MPI_INT, MPI_MIN,
                           MPI_COMM_WORLD),
             "MPI_Allreduce(option minimum)");
-  mpi_check(MPI_Allreduce(values, maxima, 11, MPI_INT, MPI_MAX,
+  mpi_check(MPI_Allreduce(values, maxima, 12, MPI_INT, MPI_MAX,
                           MPI_COMM_WORLD),
             "MPI_Allreduce(option maximum)");
-  for (int i = 0; i < 11; ++i) {
+  for (int i = 0; i < 12; ++i) {
     if (minima[i] == maxima[i])
       continue;
     if (rank == 0) {
       std::fprintf(stderr,
                    "--blocks, --threads, --warmup, --iters, --gin-contexts, "
                    "--gin-queue-depth, --network-issuers, --async-flush, "
-                   "--credit-pipeline, --strong-data-signals, and "
+                   "--credit-pipeline, --strong-data-signals, --epoch-stress, and "
                    "--profile-phases must match on every rank\n");
     }
     MPI_Abort(MPI_COMM_WORLD, 1);
@@ -452,20 +466,21 @@ inline std::vector<value_type> make_send_buffer(const Plan &plan) {
   return buffer;
 }
 
-inline std::vector<value_type> make_expected_buffer(const Plan &plan) {
+inline std::vector<value_type> make_expected_buffer(const Plan &plan,
+                                                     value_type bias = 0) {
   std::vector<value_type> buffer(plan.global_recv_capacity, kUntouched);
   for (int source = 0; source < plan.size; ++source) {
     for (std::uint64_t i = 0; i < plan.recv_counts[source]; ++i) {
       buffer[plan.recv_offsets[source] + i] =
-          value_for(source, plan.rank, i);
+          static_cast<value_type>(value_for(source, plan.rank, i) + bias);
     }
   }
   return buffer;
 }
 
 inline int validate(const Plan &plan, const std::vector<value_type> &observed,
-                    const char *implementation) {
-  std::vector<value_type> expected = make_expected_buffer(plan);
+                    const char *implementation, value_type bias = 0) {
+  std::vector<value_type> expected = make_expected_buffer(plan, bias);
   int local_errors = 0;
   for (std::size_t i = 0; i < expected.size(); ++i) {
     if (observed[i] == expected[i])
