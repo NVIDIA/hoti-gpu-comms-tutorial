@@ -132,10 +132,10 @@ The launch is split into two kernels:
 Keeping the sends in a kernel with no remote waits avoids filling the GPU with
 waiting CTAs before all producer CTAs have run.
 
-Each non-empty shard attaches one weak signal increment to its put. The plan
-does not change during the program, so a CTA expects the same number of
+Each non-empty issuer slice attaches one weak signal increment to its put. The
+plan does not change during the program, so a CTA expects the same number of
 increments on every launch. At epoch `e`, it waits for
-`e * expected_nonempty_issuer_slices`. An empty shard neither signals nor
+`e * expected_nonempty_issuer_slices`. An empty slice neither signals nor
 contributes to that threshold.
 
 By default one thread issues each assigned GIN shard. `--network-issuers N`

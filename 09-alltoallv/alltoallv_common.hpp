@@ -103,17 +103,18 @@ inline std::uint64_t parse_bytes(const char *text) {
   return *end == '\0' ? static_cast<std::uint64_t>(value) * scale : 0;
 }
 
-inline void print_usage(const char *program) {
+inline void print_usage(const char *program,
+                        bool allow_network_issuers = false) {
   std::printf(
       "Usage: %s [--pattern uniform|offdiagonal|skewed|sparse] "
       "[--bytes-per-rank N[K|M|G]] [--warmup N] [--iters N] "
       "[--blocks N] [--threads N] [--gin-contexts N] "
-      "[--gin-queue-depth N] [--network-issuers N] "
-      "[--profile-phases]\n",
-      program);
+      "[--gin-queue-depth N] %s[--profile-phases]\n",
+      program, allow_network_issuers ? "[--network-issuers N] " : "");
 }
 
-inline Options parse_options(int argc, char **argv, int rank) {
+inline Options parse_options(int argc, char **argv, int rank,
+                             bool allow_network_issuers = false) {
   Options options;
   for (int i = 1; i < argc; ++i) {
     auto need_value = [&](const char *name) -> const char * {
@@ -142,7 +143,8 @@ inline Options parse_options(int argc, char **argv, int rank) {
     } else if (std::strcmp(argv[i], "--gin-queue-depth") == 0) {
       options.gin_queue_depth =
           std::atoi(need_value("--gin-queue-depth"));
-    } else if (std::strcmp(argv[i], "--network-issuers") == 0) {
+    } else if (allow_network_issuers &&
+               std::strcmp(argv[i], "--network-issuers") == 0) {
       options.network_issuers =
           std::atoi(need_value("--network-issuers"));
     } else if (std::strcmp(argv[i], "--profile-phases") == 0) {
@@ -171,7 +173,7 @@ inline Options parse_options(int argc, char **argv, int rank) {
        options.network_issuers > options.threads)) {
     if (rank == 0) {
       std::fprintf(stderr, "Invalid arguments\n");
-      print_usage(argv[0]);
+      print_usage(argv[0], allow_network_issuers);
     }
     MPI_Abort(MPI_COMM_WORLD, 1);
   }

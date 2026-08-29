@@ -148,10 +148,12 @@ inline SetupResult prepare(State *state, int *argc, char ***argv,
   alltoallv::mpi_check(MPI_Comm_size(MPI_COMM_WORLD, &state->size),
                        "MPI_Comm_size");
 
-  *options = alltoallv::parse_options(*argc, *argv, state->rank);
+  const bool allow_network_issuers = backend == Backend::HybridRail;
+  *options = alltoallv::parse_options(*argc, *argv, state->rank,
+                                      allow_network_issuers);
   if (options->help) {
     if (state->rank == 0)
-      alltoallv::print_usage((*argv)[0]);
+      alltoallv::print_usage((*argv)[0], allow_network_issuers);
     return SetupResult::Skipped;
   }
   alltoallv::require_matching_collective_options(*options, state->rank);
