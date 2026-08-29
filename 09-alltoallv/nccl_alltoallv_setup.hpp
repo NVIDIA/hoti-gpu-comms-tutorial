@@ -80,6 +80,23 @@ inline void print_skip(const State &state, const char *reason) {
     std::printf("SKIP: %s\n", reason);
 }
 
+inline const char *gin_type_name(ncclGinType_t type) {
+  switch (type) {
+  case NCCL_GIN_TYPE_NONE:
+    return "none";
+  case NCCL_GIN_TYPE_PROXY:
+    return "proxy";
+  case NCCL_GIN_TYPE_GDAKI:
+    return "GDAKI";
+  case NCCL_GIN_TYPE_GPI:
+    return "GPI";
+  case NCCL_GIN_TYPE_EFA_GDA:
+    return "EFA GDA";
+  default:
+    return "unknown";
+  }
+}
+
 inline void finish(State *state) {
   if (state->dev_comm_created) {
     ALLTOALLV_NCCL_CHECK(ncclDevCommDestroy(state->comm, &state->dev_comm));
@@ -449,10 +466,12 @@ inline SetupResult prepare(State *state, int *argc, char ***argv,
     std::printf("NCCL topology: world=%d, LSA=%d, rail=%d\n", state->size,
                 state->lsa_team.nRanks, state->rail_team.nRanks);
     std::printf(
-        "NCCL API: headers=%d, runtime=%d, device=%d, GIN=%d, railed GIN=%d\n",
+        "NCCL API: headers=%d, runtime=%d, device=%d, GIN=%s (%d), "
+        "railed GIN=%s (%d)\n",
         NCCL_VERSION_CODE, runtime_version,
         static_cast<int>(properties.deviceApiSupport),
-        static_cast<int>(properties.ginType),
+        gin_type_name(properties.ginType), static_cast<int>(properties.ginType),
+        gin_type_name(properties.railedGinType),
         static_cast<int>(properties.railedGinType));
     if (backend != Backend::Lsa) {
       std::printf(

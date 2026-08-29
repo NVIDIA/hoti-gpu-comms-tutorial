@@ -122,9 +122,9 @@ make NCCL_HOME=/path/to/nccl CUDA_HOME=/path/to/cuda
 ```
 
 The Makefile puts `NCCL_HOME/lib` first in `LD_LIBRARY_PATH` for its run
-targets. It defaults to native `sm_100` (GB200) and `sm_103` (GB300) code plus
-`compute_103` PTX. Use `CUDA_ARCHS='90 100 103'` for a compatible fat binary,
-or `CUDA_ARCH=90` for a GH200-only build. The setup requires exact
+targets. It defaults to native `sm_100` (GB200) and `sm_103` (GB300) code. Use
+`CUDA_ARCHS='90 100 103'` for a compatible fat binary, or `CUDA_ARCH=90` for a
+GH200-only build. The setup requires exact
 header/runtime agreement for GIN, so confirm the selected runtime before
 launching with `ldd ./nccl_gin_alltoallv_SOLVED | grep nccl`.
 

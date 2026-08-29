@@ -33,6 +33,7 @@ struct Options {
   // A value of zero requests the default: one GIN context per CTA.
   int gin_contexts = 0;
   int gin_queue_depth = 0;
+  bool profile_phases = false;
   bool help = false;
 };
 
@@ -105,7 +106,7 @@ inline void print_usage(const char *program) {
       "Usage: %s [--pattern uniform|offdiagonal|skewed|sparse] "
       "[--bytes-per-rank N[K|M|G]] [--warmup N] [--iters N] "
       "[--blocks N] [--threads N] [--gin-contexts N] "
-      "[--gin-queue-depth N]\n",
+      "[--gin-queue-depth N] [--profile-phases]\n",
       program);
 }
 
@@ -138,6 +139,8 @@ inline Options parse_options(int argc, char **argv, int rank) {
     } else if (std::strcmp(argv[i], "--gin-queue-depth") == 0) {
       options.gin_queue_depth =
           std::atoi(need_value("--gin-queue-depth"));
+    } else if (std::strcmp(argv[i], "--profile-phases") == 0) {
+      options.profile_phases = true;
     } else if (std::strcmp(argv[i], "--help") == 0 ||
                std::strcmp(argv[i], "-h") == 0) {
       options.help = true;
@@ -174,24 +177,29 @@ inline int requested_gin_contexts(const Options &options) {
 
 inline void require_matching_collective_options(const Options &options,
                                                 int rank) {
-  int values[6] = {options.blocks, options.threads, options.warmup,
-                   options.iterations, options.gin_contexts,
-                   options.gin_queue_depth};
-  int minima[6];
-  int maxima[6];
-  mpi_check(MPI_Allreduce(values, minima, 6, MPI_INT, MPI_MIN,
+  int values[7] = {options.blocks,
+                   options.threads,
+                   options.warmup,
+                   options.iterations,
+                   options.gin_contexts,
+                   options.gin_queue_depth,
+                   static_cast<int>(options.profile_phases)};
+  int minima[7];
+  int maxima[7];
+  mpi_check(MPI_Allreduce(values, minima, 7, MPI_INT, MPI_MIN,
                           MPI_COMM_WORLD),
             "MPI_Allreduce(option minimum)");
-  mpi_check(MPI_Allreduce(values, maxima, 6, MPI_INT, MPI_MAX,
+  mpi_check(MPI_Allreduce(values, maxima, 7, MPI_INT, MPI_MAX,
                           MPI_COMM_WORLD),
             "MPI_Allreduce(option maximum)");
-  for (int i = 0; i < 6; ++i) {
+  for (int i = 0; i < 7; ++i) {
     if (minima[i] == maxima[i])
       continue;
     if (rank == 0) {
       std::fprintf(stderr,
                    "--blocks, --threads, --warmup, --iters, --gin-contexts, "
-                   "and --gin-queue-depth must match on every rank\n");
+                   "--gin-queue-depth, and --profile-phases must match on "
+                   "every rank\n");
     }
     MPI_Abort(MPI_COMM_WORLD, 1);
   }
@@ -529,6 +537,35 @@ inline void report_timing(const Plan &plan, const Options &options,
       "%s placement payload rates (%s): %.3f GB/s same-domain non-self, "
       "%.3f GB/s cross-domain\n",
       implementation, plan.placement_scope.c_str(), local_gbs, network_gbs);
+}
+
+inline void report_phase_timing(const Options &options,
+                                const char *implementation,
+                                float local_issue_ms,
+                                float local_completion_ms) {
+  float local_phase_ms[2] = {local_issue_ms, local_completion_ms};
+  float maximum_phase_ms[2] = {};
+  mpi_check(MPI_Allreduce(local_phase_ms, maximum_phase_ms, 2, MPI_FLOAT,
+                          MPI_MAX, MPI_COMM_WORLD),
+            "MPI_Allreduce(phase timing)");
+  if (options.profile_phases && maximum_phase_ms[0] >= 0.0f &&
+      maximum_phase_ms[1] >= 0.0f) {
+    int rank = 0;
+    mpi_check(MPI_Comm_rank(MPI_COMM_WORLD, &rank), "MPI_Comm_rank(phase timing)");
+    if (rank == 0) {
+      const float total_ms = maximum_phase_ms[0] + maximum_phase_ms[1];
+      const float issue_fraction =
+          total_ms == 0.0f ? 0.0f : 100.0f * maximum_phase_ms[0] / total_ms;
+      const float completion_fraction =
+          total_ms == 0.0f ? 0.0f : 100.0f * maximum_phase_ms[1] / total_ms;
+      std::printf(
+          "%s phase profile: %.3f ms/iteration send + local delivery "
+          "(%.1f%%), %.3f ms/iteration wait + scatter + flush (%.1f%%)\n",
+          implementation, maximum_phase_ms[0] / options.iterations,
+          issue_fraction, maximum_phase_ms[1] / options.iterations,
+          completion_fraction);
+    }
+  }
 }
 
 } // namespace alltoallv

@@ -8,6 +8,7 @@
 #include <nccl.h>
 
 #include <cstdio>
+#include <vector>
 
 #if NCCL_VERSION_CODE < NCCL_VERSION(2, 31, 2)
 
@@ -247,20 +248,74 @@ __global__ void wait_and_scatter(
 #endif
 }
 
-void launch(const alltoallv::nccl_setup::State &state,
-            const alltoallv::Options &options, int route_shards,
-            std::uint64_t epoch) {
+void launch_send_and_deliver_local(const alltoallv::nccl_setup::State &state,
+                                   const alltoallv::Options &options,
+                                   int route_shards) {
   send_and_deliver_local<<<options.blocks, options.threads, 0,
                            state.stream>>>(
       state.dev_comm, state.send_window, state.recv_window,
       state.plan_window, state.inbox_window, state.hybrid_slot_bytes,
       state.hybrid_domain_bytes, route_shards);
   ALLTOALLV_CUDA_CHECK(cudaGetLastError());
+}
+
+void launch_wait_and_scatter(const alltoallv::nccl_setup::State &state,
+                             const alltoallv::Options &options,
+                             int route_shards, std::uint64_t epoch) {
   wait_and_scatter<<<options.blocks, options.threads, 0, state.stream>>>(
       state.dev_comm, state.recv_window, state.plan_window,
       state.inbox_window, state.hybrid_slot_bytes,
       state.hybrid_domain_bytes, route_shards, epoch);
   ALLTOALLV_CUDA_CHECK(cudaGetLastError());
+}
+
+void launch(const alltoallv::nccl_setup::State &state,
+            const alltoallv::Options &options, int route_shards,
+            std::uint64_t epoch) {
+  launch_send_and_deliver_local(state, options, route_shards);
+  launch_wait_and_scatter(state, options, route_shards, epoch);
+}
+
+struct PhaseTimes {
+  float send_and_deliver_ms = 0.0f;
+  float wait_and_scatter_ms = 0.0f;
+};
+
+PhaseTimes profile_iterations(const alltoallv::nccl_setup::State &state,
+                              const alltoallv::Options &options,
+                              int route_shards, std::uint64_t *epoch) {
+  std::vector<cudaEvent_t> starts(options.iterations);
+  std::vector<cudaEvent_t> handoffs(options.iterations);
+  std::vector<cudaEvent_t> stops(options.iterations);
+  for (int iteration = 0; iteration < options.iterations; ++iteration) {
+    ALLTOALLV_CUDA_CHECK(cudaEventCreate(&starts[iteration]));
+    ALLTOALLV_CUDA_CHECK(cudaEventCreate(&handoffs[iteration]));
+    ALLTOALLV_CUDA_CHECK(cudaEventCreate(&stops[iteration]));
+  }
+  for (int iteration = 0; iteration < options.iterations; ++iteration) {
+    ALLTOALLV_CUDA_CHECK(cudaEventRecord(starts[iteration], state.stream));
+    launch_send_and_deliver_local(state, options, route_shards);
+    ALLTOALLV_CUDA_CHECK(
+        cudaEventRecord(handoffs[iteration], state.stream));
+    launch_wait_and_scatter(state, options, route_shards, ++*epoch);
+    ALLTOALLV_CUDA_CHECK(cudaEventRecord(stops[iteration], state.stream));
+  }
+  ALLTOALLV_CUDA_CHECK(cudaEventSynchronize(stops.back()));
+
+  PhaseTimes result;
+  for (int iteration = 0; iteration < options.iterations; ++iteration) {
+    float elapsed_ms = 0.0f;
+    ALLTOALLV_CUDA_CHECK(cudaEventElapsedTime(
+        &elapsed_ms, starts[iteration], handoffs[iteration]));
+    result.send_and_deliver_ms += elapsed_ms;
+    ALLTOALLV_CUDA_CHECK(cudaEventElapsedTime(
+        &elapsed_ms, handoffs[iteration], stops[iteration]));
+    result.wait_and_scatter_ms += elapsed_ms;
+    ALLTOALLV_CUDA_CHECK(cudaEventDestroy(stops[iteration]));
+    ALLTOALLV_CUDA_CHECK(cudaEventDestroy(handoffs[iteration]));
+    ALLTOALLV_CUDA_CHECK(cudaEventDestroy(starts[iteration]));
+  }
+  return result;
 }
 
 int choose_route_shards(const alltoallv::nccl_setup::State &state,
@@ -329,21 +384,32 @@ int main(int argc, char **argv) {
   alltoallv::mpi_check(MPI_Barrier(MPI_COMM_WORLD),
                        "MPI_Barrier(benchmark)");
 
-  cudaEvent_t start;
-  cudaEvent_t stop;
-  ALLTOALLV_CUDA_CHECK(cudaEventCreate(&start));
-  ALLTOALLV_CUDA_CHECK(cudaEventCreate(&stop));
-  ALLTOALLV_CUDA_CHECK(cudaEventRecord(start, state.stream));
-  for (int i = 0; i < options.iterations; ++i)
-    launch(state, options, route_shards, ++epoch);
-  ALLTOALLV_CUDA_CHECK(cudaEventRecord(stop, state.stream));
-  ALLTOALLV_CUDA_CHECK(cudaEventSynchronize(stop));
   float elapsed_ms = 0.0f;
-  ALLTOALLV_CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
+  PhaseTimes phases;
+  if (options.profile_phases) {
+    phases = profile_iterations(state, options, route_shards, &epoch);
+    elapsed_ms = phases.send_and_deliver_ms + phases.wait_and_scatter_ms;
+  } else {
+    cudaEvent_t start;
+    cudaEvent_t stop;
+    ALLTOALLV_CUDA_CHECK(cudaEventCreate(&start));
+    ALLTOALLV_CUDA_CHECK(cudaEventCreate(&stop));
+    ALLTOALLV_CUDA_CHECK(cudaEventRecord(start, state.stream));
+    for (int i = 0; i < options.iterations; ++i)
+      launch(state, options, route_shards, ++epoch);
+    ALLTOALLV_CUDA_CHECK(cudaEventRecord(stop, state.stream));
+    ALLTOALLV_CUDA_CHECK(cudaEventSynchronize(stop));
+    ALLTOALLV_CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
+    ALLTOALLV_CUDA_CHECK(cudaEventDestroy(stop));
+    ALLTOALLV_CUDA_CHECK(cudaEventDestroy(start));
+  }
   alltoallv::report_timing(plan, options,
                            "NCCL LSA + railed GIN AlltoAllV", elapsed_ms);
-  ALLTOALLV_CUDA_CHECK(cudaEventDestroy(stop));
-  ALLTOALLV_CUDA_CHECK(cudaEventDestroy(start));
+  if (options.profile_phases) {
+    alltoallv::report_phase_timing(
+        options, "NCCL LSA + railed GIN AlltoAllV",
+        phases.send_and_deliver_ms, phases.wait_and_scatter_ms);
+  }
 
   ALLTOALLV_CUDA_CHECK(
       cudaMemsetAsync(state.recv, 0xa5, state.recv_bytes, state.stream));

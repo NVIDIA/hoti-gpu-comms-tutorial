@@ -11,10 +11,11 @@ else
 CUDA_ARCHS ?= 100 103
 endif
 
-# Embed PTX for the highest requested architecture.  This is not a substitute
-# for native SASS on the stated target, but it preserves a forward-compatible
-# fallback for a newer compatible GPU.
-CUDA_PTX_ARCH ?= $(lastword $(CUDA_ARCHS))
+# Native SASS covers both stated targets. PTX is opt-in because CUDA device
+# linking may discard an embedded PTX image from an RDC executable; use
+# CUDA_PTX_ARCH=103 only when a forward-JIT fallback is needed, and inspect the
+# final executable with cuobjdump.
+CUDA_PTX_ARCH ?=
 
 GENCODE_FLAGS := $(foreach arch,$(CUDA_ARCHS),-gencode arch=compute_$(arch),code=sm_$(arch))
 ifneq ($(strip $(CUDA_PTX_ARCH)),)

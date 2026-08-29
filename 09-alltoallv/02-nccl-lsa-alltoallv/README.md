@@ -93,9 +93,9 @@ make NCCL_HOME=/path/to/nccl CUDA_HOME=/path/to/cuda
 
 Keep the headers and runtime from the same NCCL build. NCCL device kernels are
 compiled against implementation details in those headers. The default emits
-native `sm_100` (GB200) and `sm_103` (GB300) code plus `compute_103` PTX. Use
-`CUDA_ARCHS='90 100 103'` for a compatible fat binary, or `CUDA_ARCH=90` for
-a GH200-only build.
+native `sm_100` (GB200) and `sm_103` (GB300) code. Use
+`CUDA_ARCHS='90 100 103'` for a compatible fat binary, or `CUDA_ARCH=90` for a
+GH200-only build.
 
 ## Run on NVLink
 

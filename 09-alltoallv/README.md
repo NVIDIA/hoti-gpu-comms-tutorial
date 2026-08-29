@@ -101,6 +101,7 @@ Every executable accepts the same workload options:
 --threads N
 --gin-contexts N
 --gin-queue-depth N
+--profile-phases
 ```
 
 `--bytes-per-rank` is each source rank's total logical payload before aligned
@@ -113,6 +114,12 @@ destination a much larger share. `sparse` includes zero-count pairs.
 railed-GIN exercises. A context value of `0` (the default) requests one GIN
 context per CTA, so it preserves the original `--blocks` behavior. Set it to
 `1..--blocks` to sweep context sharing independently of CTA count.
+
+`--profile-phases` applies to the solved LSA + railed-GIN implementation. It
+separates the producer kernel (`send_and_deliver_local`) from the consumer
+kernel (`wait_and_scatter`, including scatter and flush). It is a diagnostic
+run, not a headline-performance run: it records three CUDA events per
+iteration so the two sequential stages can be tuned independently.
 
 The programs first validate one iteration, then time warm and measured
 iterations. The output separates self, same-domain, and cross-domain bytes.
@@ -259,6 +266,21 @@ NVLink:   --nodes=2 --segment=2
 IB:       --nodes=4 --segment=1 --spread-segments
 Hybrid:   --nodes=4 --segment=2 --spread-segments
 ```
+
+Pass `--segment` and `--spread-segments` to `sbatch` or `salloc` when creating
+the allocation, not only to a later `srun`: a step cannot repair an allocation
+whose trays all came from one NVL72 base block. For example, the hybrid lab
+needs two trays in each of two base blocks:
+
+```bash
+sbatch --account=coreai_libraries_nvshmem --partition=gb300-backfill \
+  --qos=user-restrictions --nodes=4 --ntasks=16 --ntasks-per-node=4 \
+  --segment=2 --spread-segments --time=00:10:00 ...
+```
+
+The hybrid executable confirms this preflight itself: a valid run reports
+`world=16, LSA=8, rail=2`, and `railed GIN=GDAKI`; otherwise it prints `SKIP`
+before launching a kernel.
 
 Use four tasks and GPUs per tray for the NVLink and hybrid rates in the table.
 Use one task and GPU per tray for the IB-only rate. Lyris does not expose its

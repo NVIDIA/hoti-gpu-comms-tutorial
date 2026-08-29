@@ -217,9 +217,9 @@ make run_SOLVED NP=16 \
   RUN_ARGS='--pattern offdiagonal --bytes-per-rank 256M --blocks 40 --threads 512 --warmup 10 --iters 50'
 ```
 
-The build defaults to native `sm_100` (GB200) and `sm_103` (GB300) code plus
-`compute_103` PTX. Use `CUDA_ARCHS='90 100 103'` for a compatible fat binary,
-or `CUDA_ARCH=90` for a GH200-only build. The run target defaults to
+The build defaults to native `sm_100` (GB200) and `sm_103` (GB300) code. Use
+`CUDA_ARCHS='90 100 103'` for a compatible fat binary, or `CUDA_ARCH=90` for a
+GH200-only build. The run target defaults to
 `NCCL_IB_MERGE_NICS=0` and `NCCL_CROSS_NIC=0` so
 NCCL builds corresponding GPU/NIC rails. Override those variables only when a
 system has a different validated mapping.
@@ -231,6 +231,20 @@ make run_SOLVED NP=8 \
   LAUNCHER='srun --nodes=2 --ntasks=8 --ntasks-per-node=4 --gpus-per-task=1' \
   RUN_ARGS='--pattern sparse --bytes-per-rank 64M --blocks 40 --threads 512 --iters 50'
 ```
+
+When the mixed path is below its target, measure the two sequential kernels
+before changing its algorithm:
+
+```bash
+make run_SOLVED NP=16 \
+  LAUNCHER='srun --mpi=pmix_v5 --nodes=4 --ntasks=16 --ntasks-per-node=4 --segment=2 --spread-segments --cpu-bind=none' \
+  RUN_ARGS='--pattern offdiagonal --bytes-per-rank 256M --blocks 40 --threads 512 --warmup 10 --iters 50 --profile-phases'
+```
+
+The additional line reports `send + local delivery` separately from `wait +
+scatter + flush`. Use it to choose the next algorithmic experiment, then turn
+the flag off for the throughput number because the optional per-iteration CUDA
+events add measurement overhead.
 
 CTA count affects both the LSA copy and the requested GIN-context count. Start
 with the default for small messages. On the Lyris placement above, start
