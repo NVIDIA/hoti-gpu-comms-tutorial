@@ -616,8 +616,7 @@ int main(int argc, char **argv) {
         phases.send_and_deliver_ms, phases.wait_and_scatter_ms);
   }
 
-  ALLTOALLV_CUDA_CHECK(
-      cudaMemsetAsync(state.recv, 0xa5, state.recv_bytes, state.stream));
+  alltoallv::nccl_setup::clear_recv_for_reuse(&state);
   launch(state, options, route_shards, ++epoch);
   ALLTOALLV_CUDA_CHECK(cudaStreamSynchronize(state.stream));
   errors = alltoallv::nccl_setup::copy_and_validate(
