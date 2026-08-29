@@ -33,6 +33,8 @@ struct Options {
   // A value of zero requests the default: one GIN context per CTA.
   int gin_contexts = 0;
   int gin_queue_depth = 0;
+  // Number of threads that issue slices of one assigned hybrid GIN shard.
+  int network_issuers = 1;
   bool profile_phases = false;
   bool help = false;
 };
@@ -106,7 +108,8 @@ inline void print_usage(const char *program) {
       "Usage: %s [--pattern uniform|offdiagonal|skewed|sparse] "
       "[--bytes-per-rank N[K|M|G]] [--warmup N] [--iters N] "
       "[--blocks N] [--threads N] [--gin-contexts N] "
-      "[--gin-queue-depth N] [--profile-phases]\n",
+      "[--gin-queue-depth N] [--network-issuers N] "
+      "[--profile-phases]\n",
       program);
 }
 
@@ -139,6 +142,9 @@ inline Options parse_options(int argc, char **argv, int rank) {
     } else if (std::strcmp(argv[i], "--gin-queue-depth") == 0) {
       options.gin_queue_depth =
           std::atoi(need_value("--gin-queue-depth"));
+    } else if (std::strcmp(argv[i], "--network-issuers") == 0) {
+      options.network_issuers =
+          std::atoi(need_value("--network-issuers"));
     } else if (std::strcmp(argv[i], "--profile-phases") == 0) {
       options.profile_phases = true;
     } else if (std::strcmp(argv[i], "--help") == 0 ||
@@ -161,7 +167,8 @@ inline Options parse_options(int argc, char **argv, int rank) {
        options.threads < 32 || options.threads > 1024 ||
        options.threads % 32 != 0 || options.gin_contexts < 0 ||
        options.gin_contexts > options.blocks ||
-       options.gin_queue_depth < 0)) {
+       options.gin_queue_depth < 0 || options.network_issuers < 1 ||
+       options.network_issuers > options.threads)) {
     if (rank == 0) {
       std::fprintf(stderr, "Invalid arguments\n");
       print_usage(argv[0]);
@@ -177,28 +184,30 @@ inline int requested_gin_contexts(const Options &options) {
 
 inline void require_matching_collective_options(const Options &options,
                                                 int rank) {
-  int values[7] = {options.blocks,
+  int values[8] = {options.blocks,
                    options.threads,
                    options.warmup,
                    options.iterations,
                    options.gin_contexts,
                    options.gin_queue_depth,
+                   options.network_issuers,
                    static_cast<int>(options.profile_phases)};
-  int minima[7];
-  int maxima[7];
-  mpi_check(MPI_Allreduce(values, minima, 7, MPI_INT, MPI_MIN,
+  int minima[8];
+  int maxima[8];
+  mpi_check(MPI_Allreduce(values, minima, 8, MPI_INT, MPI_MIN,
                           MPI_COMM_WORLD),
             "MPI_Allreduce(option minimum)");
-  mpi_check(MPI_Allreduce(values, maxima, 7, MPI_INT, MPI_MAX,
+  mpi_check(MPI_Allreduce(values, maxima, 8, MPI_INT, MPI_MAX,
                           MPI_COMM_WORLD),
             "MPI_Allreduce(option maximum)");
-  for (int i = 0; i < 7; ++i) {
+  for (int i = 0; i < 8; ++i) {
     if (minima[i] == maxima[i])
       continue;
     if (rank == 0) {
       std::fprintf(stderr,
                    "--blocks, --threads, --warmup, --iters, --gin-contexts, "
-                   "--gin-queue-depth, and --profile-phases must match on "
+                   "--gin-queue-depth, --network-issuers, and "
+                   "--profile-phases must match on "
                    "every rank\n");
     }
     MPI_Abort(MPI_COMM_WORLD, 1);

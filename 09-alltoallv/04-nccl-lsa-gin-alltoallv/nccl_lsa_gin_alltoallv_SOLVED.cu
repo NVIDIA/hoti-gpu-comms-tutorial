@@ -116,7 +116,7 @@ __global__ void send_and_deliver_local(
     ncclDevComm dev_comm, ncclWindow_t send_window,
     ncclWindow_t recv_window, ncclWindow_t plan_window,
     ncclWindow_t inbox_window, std::size_t slot_bytes,
-    std::size_t domain_bytes, int route_shards) {
+    std::size_t domain_bytes, int route_shards, int network_issuers) {
 #if __CUDA_ARCH__ >= 700
   const int context_count =
       min(static_cast<int>(gridDim.x),
@@ -153,7 +153,7 @@ __global__ void send_and_deliver_local(
     copy_values(source, target, count, threadIdx.x, blockDim.x);
   }
 
-  if (threadIdx.x == 0) {
+  if (threadIdx.x < network_issuers) {
     const int task_count = rail.nRanks * lsa.nRanks;
     for (int task = 0; task < task_count; ++task) {
       const int destination_domain = task / lsa.nRanks;
@@ -175,12 +175,20 @@ __global__ void send_and_deliver_local(
         shard_slice(entry.send_count, shard, route_shards, &offset, &count);
         if (count == 0)
           continue;
+        std::uint64_t issuer_offset = 0;
+        std::uint64_t issuer_count = 0;
+        shard_slice(count, threadIdx.x, network_issuers, &issuer_offset,
+                    &issuer_count);
+        if (issuer_count == 0)
+          continue;
         const std::size_t inbox_offset =
             rail.rank * domain_bytes + destination_local * slot_bytes +
-            offset * sizeof(value_type);
+            (offset + issuer_offset) * sizeof(value_type);
         gin.put(rail, destination_domain, inbox_window, inbox_offset,
-                send_window, (entry.send_offset + offset) * sizeof(value_type),
-                count * sizeof(value_type),
+                send_window,
+                (entry.send_offset + offset + issuer_offset) *
+                    sizeof(value_type),
+                issuer_count * sizeof(value_type),
                 ncclGin_WeakSignalInc{signal});
       }
     }
@@ -193,7 +201,7 @@ __global__ void wait_and_scatter(
     ncclDevComm dev_comm, ncclWindow_t recv_window,
     ncclWindow_t plan_window, ncclWindow_t inbox_window,
     std::size_t slot_bytes, std::size_t domain_bytes,
-    int route_shards, std::uint64_t epoch) {
+    int route_shards, int network_issuers, std::uint64_t epoch) {
 #if __CUDA_ARCH__ >= 700
   const int context_count =
       min(static_cast<int>(gridDim.x),
@@ -230,7 +238,13 @@ __global__ void wait_and_scatter(
         std::uint64_t offset = 0;
         std::uint64_t count = 0;
         shard_slice(entry.recv_count, shard, route_shards, &offset, &count);
-        expected += count != 0;
+        for (int issuer = 0; issuer < network_issuers; ++issuer) {
+          std::uint64_t issuer_offset = 0;
+          std::uint64_t issuer_count = 0;
+          shard_slice(count, issuer, network_issuers, &issuer_offset,
+                      &issuer_count);
+          expected += issuer_count != 0;
+        }
       }
     }
   }
@@ -255,7 +269,7 @@ void launch_send_and_deliver_local(const alltoallv::nccl_setup::State &state,
                            state.stream>>>(
       state.dev_comm, state.send_window, state.recv_window,
       state.plan_window, state.inbox_window, state.hybrid_slot_bytes,
-      state.hybrid_domain_bytes, route_shards);
+      state.hybrid_domain_bytes, route_shards, options.network_issuers);
   ALLTOALLV_CUDA_CHECK(cudaGetLastError());
 }
 
@@ -265,7 +279,8 @@ void launch_wait_and_scatter(const alltoallv::nccl_setup::State &state,
   wait_and_scatter<<<options.blocks, options.threads, 0, state.stream>>>(
       state.dev_comm, state.recv_window, state.plan_window,
       state.inbox_window, state.hybrid_slot_bytes,
-      state.hybrid_domain_bytes, route_shards, epoch);
+      state.hybrid_domain_bytes, route_shards, options.network_issuers,
+      epoch);
   ALLTOALLV_CUDA_CHECK(cudaGetLastError());
 }
 
@@ -365,8 +380,10 @@ int main(int argc, char **argv) {
   alltoallv::print_plan(plan, options, "NCCL LSA + railed GIN AlltoAllV");
   const int route_shards = choose_route_shards(state, options, plan);
   if (state.rank == 0) {
-    std::printf("NCCL hybrid routing: %d shard(s) per remote route\n",
-                route_shards);
+    std::printf(
+        "NCCL hybrid routing: %d shard(s) per remote route, %d issuer(s) "
+        "per shard\n",
+        route_shards, options.network_issuers);
   }
   std::uint64_t epoch = 1;
   launch(state, options, route_shards, epoch);

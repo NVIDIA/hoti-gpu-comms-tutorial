@@ -135,8 +135,16 @@ waiting CTAs before all producer CTAs have run.
 Each non-empty shard attaches one weak signal increment to its put. The plan
 does not change during the program, so a CTA expects the same number of
 increments on every launch. At epoch `e`, it waits for
-`e * expected_nonempty_shards`. An empty shard neither signals nor contributes
-to that threshold.
+`e * expected_nonempty_issuer_slices`. An empty shard neither signals nor
+contributes to that threshold.
+
+By default one thread issues each assigned GIN shard. `--network-issuers N`
+splits each assigned shard into up to `N` vector-aligned slices, one put per
+issuing thread. Every non-empty slice carries the CTA's weak signal increment,
+and the receiver includes all of those increments in its cumulative threshold.
+This lets a CTA post several independent GIN work requests without changing
+the inbox layout, signal IDs, or reuse protocol. Start with `N=1`; tune it
+only after the default has passed correctness checks on the target topology.
 
 The weak signal makes its own inbox shard visible before the receiver observes
 the increment. It does not make the sender's source range safe to reuse;
@@ -184,8 +192,8 @@ is indexed by world rank.
 Open `nccl_lsa_gin_alltoallv.cu` and complete its three TODOs:
 
 1. copy this CTA's contiguous same-domain shard to its LSA target;
-2. put each non-empty remote shard directly into its fixed inbox slot and
-   attach a weak increment of this CTA's signal;
+2. put each non-empty remote issuer slice directly into its fixed inbox slot
+   and attach a weak increment of this CTA's signal;
 3. wait for this CTA's cumulative signal threshold, then call the supplied
    helper that scatters its assigned shards through LSA pointers.
 
@@ -251,6 +259,12 @@ with the default for small messages. On the Lyris placement above, start
 large-message tuning with `--blocks 40 --threads 512`, then sweep the CTA
 count. The best value depends on the LSA-team size, remote-domain count, GPU,
 and message distribution; measure again on the tutorial system.
+
+Once the default is correct, a focused producer experiment is
+`--network-issuers 2`, `4`, and `8` with CTA count, contexts, queue depth, and
+workload held fixed. Compare them with `N=1`; more issuer threads add GIN work
+requests and signals, so a higher value is useful only if it shortens the
+network-completion phase.
 
 The program prints `SKIP` if the placement does not form uniform LSA and rail
 teams or if railed GIN is unavailable. For performance comparisons, use the
