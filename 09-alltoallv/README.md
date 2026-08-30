@@ -69,6 +69,8 @@ protocol remains the same.
 
 Each directory contains a starter, a matching `_SOLVED` reference, a
 Makefile, and the exact API and topology requirements for that implementation.
+Each AlltoAllV invocation uses one payload kernel; one-time metadata setup and
+optional validation helpers are outside the collective itself.
 
 ## What changes between NVSHMEM and NCCL
 
@@ -116,10 +118,11 @@ context per CTA, so it preserves the original `--blocks` behavior. Set it to
 `1..--blocks` to sweep context sharing independently of CTA count.
 
 `--profile-phases` applies to the solved LSA + railed-GIN implementation. It
-separates the producer kernel (`send_and_deliver_local`) from the consumer
-kernel (`wait_and_scatter`, including scatter and flush). It is a diagnostic
-run, not a headline-performance run: it records three CUDA events per
-iteration so the two sequential stages can be tuned independently.
+keeps the one-kernel collective intact and emits an in-kernel CTA trace for
+send/local delivery plus the cooperative handoff, signal wait, LSA scatter,
+flush, and final completion barrier. It is a diagnostic run, not a
+headline-performance run: it records CUDA events and trace values for each
+iteration.
 
 The LSA + railed-GIN exercise additionally accepts `--network-issuers N`,
 `--async-flush`, `--credit-pipeline`, `--strong-data-signals`, and
@@ -258,8 +261,9 @@ runs, not from dividing the best-of-sweep table above. The full-GIN pair used
 64 MiB/rank; the other pairs used 256 MiB/rank.
 
 The comparison is topology dependent. NCCL led on the direct LSA and
-single-rail full-GIN placements. NVSHMEM's single mixed kernel slightly led
-the staged NCCL algorithm on the two-NVL72 placement.
+single-rail full-GIN placements. The two-NVL72 hybrid result predates its
+single-kernel cooperative fusion, so rerun that placement before using the
+historical mixed-path comparison.
 
 The harness uses MPI only for bootstrap, metadata needed to construct the
 reference answer, error reduction, and benchmark alignment. MPI is not the

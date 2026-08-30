@@ -6,6 +6,8 @@
 #include "../../common/nvshmem_exercise.h"
 #include "../alltoallv_common.hpp"
 
+#include <cooperative_groups.h>
+
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
@@ -16,6 +18,7 @@
 namespace {
 
 using alltoallv::value_type;
+namespace cg = cooperative_groups;
 
 constexpr std::uint64_t kDefaultDirectChunkBytes = 256ull << 10;
 constexpr std::uint64_t kDefaultNetworkChunkBytes = 4ull << 20;
@@ -26,8 +29,6 @@ enum class QpQuietScope : int { thread, warp, block };
 __device__ std::uint64_t align_bytes(std::uint64_t value) {
   return (value + kMetadataAlignment - 1) & ~(kMetadataAlignment - 1);
 }
-
-__global__ void begin_transfer(int) { nvshmemx_barrier_all_block(); }
 
 __global__ void exchange_plan(const std::uint64_t *send_counts_bytes,
                               std::uint64_t *recv_counts_bytes,
@@ -61,15 +62,24 @@ __global__ void exchange_plan(const std::uint64_t *send_counts_bytes,
     *status = -1;
 }
 
-__global__ void
-send_chunks(const value_type *send_buffer, value_type *recv_buffer,
-            const std::uint64_t *send_counts_bytes,
-            const std::uint64_t *send_offsets_bytes,
-            const std::uint64_t *remote_recv_offsets_bytes,
-            std::uint64_t *signals, int rank, int nranks,
-            std::uint64_t direct_chunk_bytes, std::uint64_t network_chunk_bytes,
-            const nvshmemx_qp_handle_t *network_qps, int network_qp_count,
-            std::uint64_t max_chunks, std::uint64_t epoch) {
+__global__ void nvshmem_alltoallv_kernel(
+    const value_type *send_buffer, value_type *recv_buffer,
+    const std::uint64_t *send_counts_bytes,
+    const std::uint64_t *send_offsets_bytes,
+    const std::uint64_t *recv_signal_counts,
+    const std::uint64_t *remote_recv_offsets_bytes, std::uint64_t *signals,
+    int rank, int nranks, std::uint64_t direct_chunk_bytes,
+    std::uint64_t network_chunk_bytes,
+    const nvshmemx_qp_handle_t *network_qps, int network_qp_count,
+    std::uint64_t max_chunks, QpQuietScope quiet_scope,
+    std::uint64_t epoch) {
+  const cg::grid_group grid = cg::this_grid();
+  // One CTA performs the collective entry handshake; the cooperative grid
+  // then holds every producer until all PEs have arrived.
+  if (blockIdx.x == 0)
+    nvshmemx_barrier_all_block();
+  grid.sync();
+
   /*
    * TODO: Assign rank-rotated destination/chunk pairs to CTAs in chunk-major
    * order. Copy self and directly accessible messages in direct_chunk_bytes
@@ -83,34 +93,40 @@ send_chunks(const value_type *send_buffer, value_type *recv_buffer,
   (void)send_counts_bytes;
   (void)send_offsets_bytes;
   (void)remote_recv_offsets_bytes;
-  (void)signals;
-  (void)rank;
-  (void)nranks;
-  (void)direct_chunk_bytes;
-  (void)network_chunk_bytes;
   (void)network_qps;
   (void)network_qp_count;
-  (void)max_chunks;
-  (void)epoch;
-}
+  (void)direct_chunk_bytes;
+  (void)network_chunk_bytes;
+  // Keep the producer/completion phase boundary even in the starter: the
+  // one-kernel launch is cooperative so waiting CTAs cannot starve producers.
+  grid.sync();
 
-__global__ void wait_for_chunks(const std::uint64_t *recv_signal_counts,
-                                std::uint64_t *signals, int rank, int nranks,
-                                std::uint64_t max_chunks,
-                                QpQuietScope quiet_scope, std::uint64_t epoch) {
-  /*
-   * TODO: Wait for the number of source signals supplied by the route-plan
-   * exchange. Direct and network peers signal once per route-specific chunk.
-   * Cooperatively quiet every default and custom QP using quiet_scope, and
-   * wait for the incoming signals before returning.
-   */
-  (void)recv_signal_counts;
-  (void)signals;
-  (void)rank;
-  (void)nranks;
-  (void)max_chunks;
-  (void)quiet_scope;
-  (void)epoch;
+  // The controller CTA owns the QP completion and incoming-signal waits.
+  // Keep the phase boundary below: other CTAs wait at the grid sync while the
+  // controller finishes the source-side quiet.
+  if (blockIdx.x == 0) {
+    /*
+     * TODO: Cooperatively quiet every default and custom QP using
+     * quiet_scope, so this PE can safely reuse its source buffer.
+     */
+    (void)quiet_scope;
+  }
+  grid.sync();
+
+  if (blockIdx.x == 0) {
+    /*
+     * TODO: Wait for the number of source signals supplied by the route-plan
+     * exchange. Direct and network peers signal once per route-specific chunk
+     * before the kernel may return.
+     */
+    (void)recv_signal_counts;
+    (void)signals;
+    (void)rank;
+    (void)nranks;
+    (void)max_chunks;
+    (void)epoch;
+  }
+  grid.sync();
 }
 
 std::uint64_t chunk_bytes_from_environment(const char *name,
@@ -369,31 +385,102 @@ void launch_alltoallv(const value_type *send_buffer, value_type *recv_buffer,
                       int network_qp_count, std::uint64_t max_chunks,
                       QpQuietScope quiet_scope, std::uint64_t epoch,
                       const alltoallv::Options &options, cudaStream_t stream) {
-  int unused = 0;
-  void *begin_args[] = {&unused};
-  int begin_status = nvshmemx_collective_launch(
-      reinterpret_cast<const void *>(begin_transfer), dim3(1),
-      dim3(options.threads), begin_args, 0, stream);
-  if (begin_status != NVSHMEMX_SUCCESS) {
-    std::fprintf(stderr, "Rank %d: NVSHMEM entry launch failed: %d\n", rank,
-                 begin_status);
-    MPI_Abort(MPI_COMM_WORLD, begin_status);
+  void *args[] = {&send_buffer,
+                  &recv_buffer,
+                  &send_counts_bytes,
+                  &send_offsets_bytes,
+                  &recv_signal_counts,
+                  &remote_recv_offsets_bytes,
+                  &signals,
+                  &rank,
+                  &nranks,
+                  &direct_chunk_bytes,
+                  &network_chunk_bytes,
+                  &network_qps,
+                  &network_qp_count,
+                  &max_chunks,
+                  &quiet_scope,
+                  &epoch};
+  int status = nvshmemx_collective_launch(
+      reinterpret_cast<const void *>(nvshmem_alltoallv_kernel),
+      dim3(options.blocks), dim3(options.threads), args, 0, stream);
+  if (status != NVSHMEMX_SUCCESS) {
+    std::fprintf(stderr, "Rank %d: NVSHMEM AlltoAllV launch failed: %d\n",
+                 rank, status);
+    MPI_Abort(MPI_COMM_WORLD, status);
   }
-  send_chunks<<<options.blocks, options.threads, 0, stream>>>(
-      send_buffer, recv_buffer, send_counts_bytes, send_offsets_bytes,
-      remote_recv_offsets_bytes, signals, rank, nranks, direct_chunk_bytes,
-      network_chunk_bytes, network_qps, network_qp_count, max_chunks, epoch);
-  CUDA_CHECK(cudaGetLastError());
-  void *args[] = {&recv_signal_counts, &signals,     &rank, &nranks,
-                  &max_chunks,         &quiet_scope, &epoch};
-  int wait_status = nvshmemx_collective_launch(
-      reinterpret_cast<const void *>(wait_for_chunks), dim3(1),
-      dim3(options.threads), args, 0, stream);
-  if (wait_status != NVSHMEMX_SUCCESS) {
-    std::fprintf(stderr, "Rank %d: NVSHMEM wait launch failed: %d\n", rank,
-                 wait_status);
-    MPI_Abort(MPI_COMM_WORLD, wait_status);
+}
+
+void require_cooperative_grid(
+    const value_type *send_buffer, value_type *recv_buffer,
+    const std::uint64_t *send_counts_bytes,
+    const std::uint64_t *send_offsets_bytes,
+    const std::uint64_t *recv_signal_counts,
+    const std::uint64_t *remote_recv_offsets_bytes, std::uint64_t *signals,
+    int rank, int nranks, std::uint64_t direct_chunk_bytes,
+    std::uint64_t network_chunk_bytes,
+    const nvshmemx_qp_handle_t *network_qps, int network_qp_count,
+    std::uint64_t max_chunks, QpQuietScope quiet_scope,
+    const alltoallv::Options &options) {
+  int device = 0;
+  CUDA_CHECK(cudaGetDevice(&device));
+  int local_supported = 0;
+  CUDA_CHECK(cudaDeviceGetAttribute(
+      &local_supported, cudaDevAttrCooperativeLaunch, device));
+  int all_supported = 0;
+  alltoallv::mpi_check(MPI_Allreduce(&local_supported, &all_supported, 1,
+                                     MPI_INT, MPI_LAND, MPI_COMM_WORLD),
+                       "MPI_Allreduce(cooperative launch support)");
+  if (!all_supported) {
+    if (rank == 0) {
+      std::fprintf(stderr,
+                   "The single-kernel NVSHMEM implementation requires CUDA "
+                   "cooperative launch support on every PE\n");
+    }
+    MPI_Abort(MPI_COMM_WORLD, 1);
   }
+
+  std::uint64_t epoch = 1;
+  void *args[] = {&send_buffer,
+                  &recv_buffer,
+                  &send_counts_bytes,
+                  &send_offsets_bytes,
+                  &recv_signal_counts,
+                  &remote_recv_offsets_bytes,
+                  &signals,
+                  &rank,
+                  &nranks,
+                  &direct_chunk_bytes,
+                  &network_chunk_bytes,
+                  &network_qps,
+                  &network_qp_count,
+                  &max_chunks,
+                  &quiet_scope,
+                  &epoch};
+  int local_limit = 0;
+  int query_status = nvshmemx_collective_launch_query_gridsize(
+      reinterpret_cast<const void *>(nvshmem_alltoallv_kernel),
+      dim3(options.threads), args, 0, &local_limit);
+  int local_ready = query_status == NVSHMEMX_SUCCESS &&
+                    local_limit >= options.blocks;
+  int all_ready = 0;
+  alltoallv::mpi_check(MPI_Allreduce(&local_ready, &all_ready, 1, MPI_INT,
+                                     MPI_LAND, MPI_COMM_WORLD),
+                       "MPI_Allreduce(cooperative launch capacity)");
+  int collective_limit = 0;
+  alltoallv::mpi_check(MPI_Allreduce(&local_limit, &collective_limit, 1,
+                                     MPI_INT, MPI_MIN, MPI_COMM_WORLD),
+                       "MPI_Allreduce(cooperative grid limit)");
+  if (all_ready)
+    return;
+  if (rank == 0) {
+    std::fprintf(stderr,
+                 "--blocks=%d exceeds the single-kernel cooperative grid "
+                 "limit (%d); lower --blocks on every PE\n",
+                 options.blocks, collective_limit);
+  }
+  MPI_Abort(MPI_COMM_WORLD, query_status == NVSHMEMX_SUCCESS ? 1
+                                                               : query_status);
 }
 
 void free_allocations(value_type *send_buffer, value_type *recv_buffer,
@@ -603,6 +690,11 @@ int main(int argc, char **argv) {
     std::free(host_network_qps);
     return 1;
   }
+  require_cooperative_grid(
+      send_buffer, recv_buffer, send_counts_bytes, send_offsets_bytes,
+      recv_signal_counts, remote_recv_offsets_bytes, signals, context.rank,
+      context.size, direct_chunk_bytes, network_chunk_bytes, network_qps,
+      network_qp_count, max_chunks, quiet_scope, options);
 
   if (context.rank == 0)
     std::printf("NVSHMEM chunk sizes: direct=%llu bytes, network=%llu bytes\n",

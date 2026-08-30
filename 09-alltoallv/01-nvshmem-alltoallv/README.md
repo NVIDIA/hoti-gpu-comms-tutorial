@@ -50,18 +50,27 @@ NVSHMEM path. Unless `NETWORK_QPS` is set, the program requests 16 QPs for a
 network-only run, eight for a mixed run, and one unused handle for a
 direct-only run.
 
-Each call begins with a block-scoped world barrier on the same CUDA stream.
-That handshake says every PE has finished consuming the previous receive
-buffer before any PE can overwrite it. Every direct or network chunk has a
-separate signal slot. The nonblocking put-with-signal orders its payload before
-its signal without quieting after every chunk. A second kernel waits for the
-signal counts the senders supplied during setup before the CUDA stream can
-consume the buffer. That kernel also quiets all default and custom QPs so the
-local send buffer is safe to reuse. The network put itself is always
-issued by one thread; only the cooperation used by `quiet` changes. A
-direct-only run uses thread-scoped quiet, a network-only run uses warp-scoped
-quiet, and a mixed run uses block-scoped quiet. The choice is collective and
-is made once from the routes reported by `nvshmem_ptr`.
+Each collective call is one cooperatively launched kernel. Its controller CTA
+performs the block-scoped world barrier, then a CUDA grid barrier releases the
+resident producer CTAs together. That cross-PE handshake says every PE has
+finished consuming the previous receive buffer before any PE can overwrite it.
+Every direct or network chunk has a separate signal slot, and the nonblocking
+put-with-signal orders its payload before its signal without quieting after
+every chunk. After all producer CTAs finish, a grid barrier lets the controller
+CTA quiet all default and custom QPs and wait for the route-plan signal counts
+before the kernel returns. The controller's `nvshmemx_barrier_all_block` is
+the cross-PE operation; the CUDA grid barriers only synchronize CTAs on one
+GPU. The network put itself is always issued by one thread; only the
+cooperation used by `quiet` changes. A direct-only run uses thread-scoped
+quiet, a network-only run uses warp-scoped quiet, and a mixed run uses
+block-scoped quiet. The choice is collective and is made once from the routes
+reported by `nvshmem_ptr`.
+
+Because the kernel uses cooperative launch, all requested CTAs must be
+resident concurrently. Before the timing loop, the program verifies
+cooperative-launch support and queries the fused kernel's cooperative grid
+limit across all PEs. It rejects an oversized `--blocks` value rather than
+risking a producer/receiver deadlock.
 
 Signals and quiet answer different questions. The receiver waits for signals
 before reading its local receive buffer. Quiet is local to the sender and
@@ -237,21 +246,24 @@ same allocation and report both the primitive and raw-hardware percentages.
 
 ## Exercise
 
-Complete the three communication functions in `nvshmem_alltoallv.cu`.
+Complete the three marked communication regions in `nvshmem_alltoallv.cu`.
 
 1. In `exchange_plan`, use block-scoped all-to-all collectives to exchange
    counts, receive offsets, and the sender-selected signal counts.
-2. In `send_chunks`, assign destination/chunk pairs in chunk-major order so
-   adjacent CTAs begin on different destinations, and rotate the first
-   destination by the source rank to avoid synchronized incast. Copy self and
-   direct-peer segments in the smaller direct chunks. For a network PE, issue
-   each larger network chunk with a QP-specific thread-scoped NBI
-   put-and-signal. Select the handle from the destination and chunk index.
-3. In `wait_for_chunks`, wait for the signal count exchanged by each source.
-   Use the source PE and chunk index to address the correct signal slot, and
-   quiet all QPs so the sender can safely reuse its input. Use the supplied
-   scope: one thread for an all-direct placement, one warp for network-only,
-   or the whole block when direct and network routes are mixed.
+2. In the producer section of `nvshmem_alltoallv_kernel`, assign
+   destination/chunk pairs in chunk-major order so adjacent CTAs begin on
+   different destinations, and rotate the first destination by the source rank
+   to avoid synchronized incast. Copy self and direct-peer segments in the
+   smaller direct chunks. For a network PE, issue each larger network chunk
+   with a QP-specific thread-scoped NBI put-and-signal. Select the handle from
+   the destination and chunk index.
+3. In the completion section of `nvshmem_alltoallv_kernel`, wait for the
+   signal count exchanged by each source. Use the source PE and chunk index to
+   address the correct signal slot, and quiet all QPs so the sender can safely
+   reuse its input. Use the supplied scope: one thread for an all-direct
+   placement, one warp for network-only, or the whole block when direct and
+   network routes are mixed. The controller-CTA and grid-synchronization
+   scaffold is already supplied.
 
 The APIs used in those functions are:
 
@@ -292,20 +304,21 @@ void nvshmemx_barrier_all_block();
 `nvshmemx_qp_create` is collective over `NVSHMEM_TEAM_WORLD`, so every PE must
 request the same number of handles. NVSHMEM allocates the returned host array,
 and the API requires it to remain allocated through finalization; this program
-frees it only after `nvshmem_finalize`. In the wait kernel, a handle value of
-`NVSHMEMX_QP_ALL` with `NVSHMEMX_PE_ALL` makes the quiet cover default and
-custom QPs. The
+frees it only after `nvshmem_finalize`. In the fused collective kernel's
+controller CTA, a handle value of `NVSHMEMX_QP_ALL` with `NVSHMEMX_PE_ALL`
+makes the quiet cover default and custom QPs. The
 [NVSHMEM QP reference](https://docs.nvidia.com/nvshmem/api/latest/gen/api/qp.html)
 defines the handle fallback, lifetime, and synchronization rules.
 
-The setup, entry-barrier, and wait kernels are launched with
-`nvshmemx_collective_launch`. The wait kernel uses NVSHMEM synchronization
-APIs, and the other two contain block collectives. The multi-CTA send phase
-uses an ordinary CUDA launch. The one-CTA wait phase is queued after it on the
-same stream and cannot begin execution until the send phase completes. Waiting
-CTAs therefore cannot block unscheduled send CTAs. See the
+The one-CTA route-plan setup is launched with `nvshmemx_collective_launch` once
+before validation and timing. Each subsequent AlltoAllV call is one
+multi-CTA `nvshmemx_collective_launch`: its controller CTA uses the
+block-scoped NVSHMEM barrier and completion APIs, while CUDA grid barriers
+separate the producer and completion phases locally. The collective-launch
+contract requires the requested grid to be concurrently resident, which the
+program preflights before it starts the timed loop. See the
 [collective-launch contract](https://docs.nvidia.com/nvshmem/api/latest/api/launch.html)
-for the residency requirement behind this split.
+for those residency requirements.
 
 A successful reference run includes:
 

@@ -135,17 +135,21 @@ registered memory and signal capacity than the default path.
 default). The setup prints the requested and created GIN resources and skips a
 run whose resources differ across ranks or cannot satisfy the CTA signal IDs.
 
-The default launch is split into two kernels:
+Each collective call is one CUDA cooperative kernel. A CTA first enters its
+world barrier (or waits for its reused credit stage), copies same-domain
+messages with LSA pointers, and issues its cross-domain shard puts. A
+grid-wide CUDA barrier then hands off from producers to consumers: every CTA
+counts and waits for its assigned incoming shards, scatters them to the final
+local GPUs, completes its outgoing GIN context, and enters the final
+world/LSA completion barrier.
 
-1. `send_and_deliver_local` enters a per-CTA world barrier, copies same-domain
-   messages with LSA pointers, and issues the cross-domain shard puts.
-2. `wait_and_scatter` counts the non-empty incoming shards assigned to each
-   CTA, waits once for all of them, copies them to the final local GPUs,
-   completes the same GIN context's outgoing puts, and enters the final world
-   barrier.
-
-Keeping the sends in a kernel with no remote waits avoids filling the GPU with
-waiting CTAs before all producer CTAs have run.
+The cooperative launch keeps the whole CTA grid resident, so no receiver CTA
+can occupy an SM while a producer CTA that supplies its signal is still
+unscheduled. Before launching, the program verifies cooperative-launch support
+and checks the selected fused kernel's capacity on every rank; it includes the
+profiled specialization when `--profile-phases` is enabled and rejects an
+oversized `--blocks` value. The CUDA grid barrier is local to one GPU; NCCL's
+world and LSA barriers still provide the cross-rank ordering.
 
 Each non-empty issuer slice attaches one weak signal increment to its put. The
 plan does not change during the program, so a CTA expects the same number of
@@ -244,12 +248,13 @@ The weak signal makes its own inbox shard visible before the receiver observes
 the increment; the terminal strong signal provides the corresponding guarantee
 for its preceding same-context puts. Neither makes the sender's source range
 safe to reuse; `gin.flush` (or the matching `gin.wait` after `--async-flush`)
-provides that local completion guarantee. The completion work is delayed until
-the second kernel so outgoing puts can remain in flight while the CTA waits for
-and scatters incoming data. In the default path, the final world barrier runs
-after every CTA has completed its outgoing context and LSA scatter. The next
-launch can then reuse the send buffer and inbox slots; the credit path instead
-uses its per-slot acknowledgements to establish that reuse condition.
+provides that local completion guarantee. The fused kernel's cooperative
+handoff delays completion until every producer CTA has issued its puts, so
+those puts can remain in flight while the CTA waits for and scatters incoming
+data. In the default path, the final world barrier runs after every CTA has
+completed its outgoing context and LSA scatter. The next launch can then reuse
+the send buffer and inbox slots; the credit path instead uses its per-slot
+acknowledgements to establish that reuse condition.
 
 The main device APIs are:
 
@@ -337,8 +342,8 @@ make run_SOLVED NP=8 \
   RUN_ARGS='--pattern sparse --bytes-per-rank 64M --blocks 40 --threads 512 --iters 50'
 ```
 
-When the mixed path is below its target, measure the two sequential kernels
-before changing its algorithm:
+When the mixed path is below its target, collect an in-kernel CTA trace before
+changing its algorithm:
 
 ```bash
 make run_SOLVED NP=16 \
@@ -357,21 +362,18 @@ case such as `--pattern skewed --network-issuers 4`, not a single-slice route.
 For a changing-payload reuse check, append `--epoch-stress 4`; it is a
 validation diagnostic and is intentionally outside the reported timing.
 
-The additional line reports `send + local delivery` separately from `wait +
-scatter + flush`. Use it to choose the next algorithmic experiment, then turn
-the flag off for the throughput number because the optional per-iteration CUDA
-events add measurement overhead.
-
-The solved build also emits a completion trace that splits the latter phase
-into plan/signal wait, LSA scatter, GIN flush, and the world barrier. It
-chooses the slowest CTA per iteration and scales those device-clock ratios to
-the CUDA-event completion time, so use it to identify the next experiment
-rather than as a standalone throughput number.
+The additional line partitions the one fused kernel into `send + local
+delivery + cooperative handoff`, plan/signal wait, LSA scatter, GIN flush,
+and the world/LSA completion barrier. It chooses the slowest CTA per iteration
+and scales those device-clock ratios to the CUDA-event kernel time, so use it
+to identify the next experiment rather than as a standalone throughput number.
 With `--async-flush`, the trace labels the asynchronous flush start with the
-first phase and its later completion wait with the flush phase. With
+wait bucket and its later completion with the flush bucket. With
 `--credit-pipeline`, the final two labels instead show the LSA completion
 barrier (including the early credit launch) and the GIN flush. With terminal
-strong signals, the first label explicitly identifies the terminal-signal wait.
+strong signals, the wait label explicitly identifies the terminal-signal wait.
+Turn the flag off for the headline throughput number because the per-iteration
+CUDA events and device trace writes add measurement overhead.
 
 CTA count affects both the LSA copy and the requested GIN-context count. Start
 with the default for small messages. On the Lyris placement above, start
