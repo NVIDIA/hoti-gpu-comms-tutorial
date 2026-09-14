@@ -68,8 +68,6 @@ struct State {
   std::size_t plan_bytes = 0;
   std::size_t hybrid_slot_bytes = 0;
   std::size_t hybrid_domain_bytes = 0;
-  std::size_t hybrid_stage_bytes = 0;
-  int hybrid_inbox_stages = 1;
   std::size_t staging_bytes = 0;
 };
 
@@ -98,48 +96,6 @@ inline const char *gin_type_name(ncclGinType_t type) {
   default:
     return "unknown";
   }
-}
-
-inline bool supports_two_rail_async_flush(const State &state) {
-  if (state.rail_team.nRanks != 2)
-    return false;
-  // NCCL 2.31.2's EFA GDA async request and wait are no-ops. Restrict the
-  // teaching candidate to backends with a real peer-completion request.
-  switch (state.railed_gin_type) {
-  case NCCL_GIN_TYPE_PROXY:
-  case NCCL_GIN_TYPE_GDAKI:
-  case NCCL_GIN_TYPE_GPI:
-    return true;
-  default:
-    return false;
-  }
-}
-
-inline bool uses_two_rail_credit_pipeline(const State &state,
-                                          const Options &options) {
-  return options.credit_pipeline && state.rail_team.nRanks == 2;
-}
-
-inline bool supports_two_rail_strong_data_signals(const State &state) {
-  if (state.rail_team.nRanks != 2)
-    return false;
-  // NCCL 2.31.2 reports strong GIN signals for these railed backends. EFA
-  // GDA does not provide that capability, so retain weak data signals there.
-  switch (state.railed_gin_type) {
-  case NCCL_GIN_TYPE_PROXY:
-  case NCCL_GIN_TYPE_GDAKI:
-  case NCCL_GIN_TYPE_GPI:
-    return true;
-  default:
-    return false;
-  }
-}
-
-inline bool uses_two_rail_strong_data_signals(const State &state,
-                                              const Options &options) {
-  return uses_two_rail_credit_pipeline(state, options) &&
-         options.strong_data_signals &&
-         supports_two_rail_strong_data_signals(state);
 }
 
 inline void finish(State *state) {
@@ -193,12 +149,10 @@ inline SetupResult prepare(State *state, int *argc, char ***argv,
   alltoallv::mpi_check(MPI_Comm_size(MPI_COMM_WORLD, &state->size),
                        "MPI_Comm_size");
 
-  const bool allow_hybrid_options = backend == Backend::HybridRail;
-  *options = alltoallv::parse_options(*argc, *argv, state->rank,
-                                      allow_hybrid_options);
+  *options = alltoallv::parse_options(*argc, *argv, state->rank);
   if (options->help) {
     if (state->rank == 0)
-      alltoallv::print_usage((*argv)[0], allow_hybrid_options);
+      alltoallv::print_usage((*argv)[0]);
     return SetupResult::Skipped;
   }
   alltoallv::require_matching_collective_options(*options, state->rank);
@@ -388,13 +342,6 @@ inline SetupResult prepare(State *state, int *argc, char ***argv,
     return SetupResult::Skipped;
   }
 
-  const bool use_credit_pipeline =
-      backend == Backend::HybridRail &&
-      uses_two_rail_credit_pipeline(*state, *options);
-  const bool use_strong_data_signals =
-      backend == Backend::HybridRail &&
-      uses_two_rail_strong_data_signals(*state, *options);
-
   state->send_bytes = std::max<std::size_t>(
       1, plan->global_send_capacity * sizeof(value_type));
   state->recv_bytes = std::max<std::size_t>(
@@ -406,11 +353,8 @@ inline SetupResult prepare(State *state, int *argc, char ***argv,
         align_bytes(plan->max_pair_count * sizeof(value_type));
     state->hybrid_domain_bytes =
         state->lsa_team.nRanks * state->hybrid_slot_bytes;
-    state->hybrid_stage_bytes = std::max<std::size_t>(
+    state->staging_bytes = std::max<std::size_t>(
         1, state->rail_team.nRanks * state->hybrid_domain_bytes);
-    state->hybrid_inbox_stages = use_credit_pipeline ? 2 : 1;
-    state->staging_bytes =
-        state->hybrid_inbox_stages * state->hybrid_stage_bytes;
   }
 
   ALLTOALLV_NCCL_CHECK(ncclMemAlloc(&state->send, state->send_bytes));
@@ -456,8 +400,7 @@ inline SetupResult prepare(State *state, int *argc, char ***argv,
       NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
   const int requested_gin_contexts =
       alltoallv::requested_gin_contexts(*options);
-  const int requested_gin_signals =
-      use_credit_pipeline ? 4 * options->blocks : options->blocks;
+  const int requested_gin_signals = options->blocks;
   if (backend == Backend::Lsa) {
     requirements.lsaBarrierCount = options->blocks;
   } else if (backend == Backend::Gin) {
@@ -470,14 +413,11 @@ inline SetupResult prepare(State *state, int *argc, char ***argv,
     requirements.ginVaSignalsRequired = false;
   } else {
     requirements.ginContextCount = requested_gin_contexts;
-    if (use_credit_pipeline)
-      requirements.lsaBarrierCount = options->blocks;
-    else
-      requirements.barrierCount = options->blocks;
+    requirements.barrierCount = options->blocks;
     requirements.ginSignalCount = requested_gin_signals;
     requirements.ginQueueDepth = options->gin_queue_depth;
     requirements.ginConnectionType = NCCL_GIN_CONNECTION_RAIL;
-    requirements.ginStrongSignalsRequired = use_strong_data_signals;
+    requirements.ginStrongSignalsRequired = false;
     requirements.ginVaSignalsRequired = false;
   }
   ALLTOALLV_NCCL_CHECK(

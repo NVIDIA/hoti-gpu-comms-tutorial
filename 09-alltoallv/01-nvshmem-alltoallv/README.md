@@ -142,108 +142,6 @@ all three architectures, use
 `make CUDA_ARCH=90`. The Makefile builds the starter and `_SOLVED` reference
 and otherwise uses GNU Make like the other C/CUDA exercises.
 
-## Run
-
-Run the solved version first. Four PEs and a 4 MiB payload per PE are the
-defaults:
-
-```bash
-make run_SOLVED NP=4
-```
-
-That default is a quick correctness run. Use a larger payload, more warmup,
-and more CTAs when measuring bandwidth.
-
-Pass command-line options through `RUN_ARGS`:
-
-```bash
-make run_SOLVED NP=4 \
-  RUN_ARGS="--pattern sparse --bytes-per-rank 16M --warmup 10 --iters 50"
-```
-
-`CHUNK_BYTES` controls direct-path and self-copy chunks;
-`NETWORK_CHUNK_BYTES` controls the larger network chunks. `NETWORK_QPS` can
-override the route-based QP default. Chunk sizes accept the same `K`, `M`, and
-`G` suffixes as `--bytes-per-rank` and must be multiples of 16 bytes. An
-explicit `NETWORK_QPS` value must be positive and identical on every PE:
-
-```bash
-make run_SOLVED NP=4 \
-  CHUNK_BYTES=256K NETWORK_CHUNK_BYTES=4M NETWORK_QPS=8
-```
-
-Placement determines which transport paths the kernel exercises. On Lyris,
-the following allocation shapes select the three cases used in the
-performance comparison:
-
-```bash
-# Direct only: eight PEs in one NVL72, spread over two compute trays
-make run_SOLVED NP=8 \
-  LAUNCHER="srun --mpi=pmix_v5 --nodes=2 --ntasks=8 --ntasks-per-node=4 --segment=2 --cpu-bind=none" \
-  RUN_ARGS="--pattern offdiagonal --bytes-per-rank 256M --blocks 128 --threads 256 --warmup 20 --iters 100"
-
-# Network only: one PE in each of four NVL72 systems
-make run_SOLVED NP=4 \
-  LAUNCHER="srun --mpi=pmix_v5 --nodes=4 --ntasks=4 --ntasks-per-node=1 --segment=1 --spread-segments --cpu-bind=none" \
-  RUN_ARGS="--pattern offdiagonal --bytes-per-rank 256M --blocks 128 --threads 256 --warmup 20 --iters 100"
-
-# Mixed: eight direct peers per NVL72 and network traffic between two NVL72s
-make run_SOLVED NP=16 \
-  LAUNCHER="srun --mpi=pmix_v5 --nodes=4 --ntasks=16 --ntasks-per-node=4 --segment=2 --spread-segments --cpu-bind=none" \
-  RUN_ARGS="--pattern offdiagonal --bytes-per-rank 256M --blocks 128 --threads 256 --warmup 20 --iters 100"
-```
-
-The `--segment` and `--spread-segments` options are Lyris allocation controls.
-Check the site documentation before copying them to another cluster. If the
-command is launched from inside an existing `srun` step, add `--overlap`.
-
-NVSHMEM must be built with an InfiniBand transport for the network forms. The
-tutorial `env.sh` selects MPI bootstrap and IBRC on JUPITER. IBRC is the
-compatible proxy-backed baseline; on an installation built for IBGDA, set
-`NVSHMEM_IB_ENABLE_IBGDA=1` to run the same kernel with GPU-initiated network
-progress. No source change is required.
-
-The network-only run should report `0 direct, 12 network`. The 16-PE mixed run
-should report `112 direct, 128 network`. Those counts verify the intended
-placement before interpreting the timing number. In a mixed run,
-the logical non-self rate includes both direct and network payload bytes. The
-placement breakdown separates directly mapped peers from cross-domain peers;
-confirm the actual route with the `NVSHMEM routes` line before treating
-cross-domain bytes as InfiniBand traffic. Multi-node NVLink systems can map an
-inter-host peer directly. Direct and network payload totals use the exact
-outgoing `nvshmem_ptr` decisions. The smaller "different domain rank"
-subcategory assumes the direct peers form symmetric domains, as they do on
-the NVL72 allocation used here.
-
-## Reference measurement on GB300 Lyris
-
-The table below uses 256 MiB per PE, 128 CTAs, 256 threads per CTA, a 256 KiB
-direct chunk, and a 4 MiB network chunk. The reported bandwidth counts each
-non-self payload byte once at the sender.
-
-| Placement | PEs | Measured | Raw send ceiling | Raw ceiling reached |
-| --- | ---: | ---: | ---: | ---: |
-| One NVL72, direct only | 8 | 3.76 TB/s | 7.2 TB/s | 52% |
-| Four GB300 NVL72s, one 800 Gb/s rail per PE | 4 | 205.7 GB/s | 400 GB/s | 51% |
-| Two NVL72s, direct plus one network rail per PE | 16 | 1.52 TB/s | 3.0 TB/s | 51% |
-
-The raw NVLink number uses half of the documented 1.8 TB/s bidirectional
-bandwidth per GPU because this benchmark counts sent bytes, not both link
-directions. A selected 800 Gb/s ConnectX-8 rail contributes 100 GB/s of send
-bandwidth. For the mixed case, 7/15 of the payload is direct and 8/15 is
-network traffic; the 3.0 TB/s ceiling assumes those paths overlap and the
-network portion is the longer one. On GB200, a selected 400 Gb/s ConnectX-7
-rail is 50 GB/s, so the corresponding four-PE network and 16-PE hybrid
-ceilings are 0.2 TB/s and 1.5 TB/s. Always calculate the ceiling from the
-active rails and their negotiated speed before comparing a run. See the
-[NVL72 reference architecture](https://docs.nvidia.com/enterprise-reference-architectures/nvl72-ai-factory/latest/components.html)
-and the [GB300 NVL72 system specifications](https://www.nvidia.com/en-us/data-center/gb300-nvl72/).
-
-These are application-level ceilings, not promises for every message size.
-Put-with-signal processing, the entry barrier, completion, and routing balance
-all reduce the application rate. Measure a matching direct copy or put on the
-same allocation and report both the primitive and raw-hardware percentages.
-
 ## Exercise
 
 Complete the three marked communication regions in `nvshmem_alltoallv.cu`.
@@ -320,18 +218,6 @@ program preflights before it starts the timed loop. See the
 [collective-launch contract](https://docs.nvidia.com/nvshmem/api/latest/api/launch.html)
 for those residency requirements.
 
-A successful reference run includes:
-
-```text
-NVSHMEM device plan: PASS
-NVSHMEM routes: ... direct, ... network
-NVSHMEM AlltoAllV correctness: PASS
-NVSHMEM AlltoAllV performance: ... ms/iteration, ... GB/s logical non-self
-NVSHMEM AlltoAllV placement payload rates (NVSHMEM direct peer): ... GB/s same-domain non-self, ... GB/s cross-domain
-```
-
 This lab implements an out-of-place collective for 32-bit values. The route
 plan is rebuilt when the counts change, and the fixed chunk size is a tuning
-parameter rather than an automatic policy. The traffic summary and split
-payload rates use the direct-peer domains reported by `nvshmem_ptr`. The route
-summary reports what was mapped directly and what used the network path.
+parameter rather than an automatic policy.

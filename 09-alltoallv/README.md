@@ -115,40 +115,17 @@ destination a much larger share. `sparse` includes zero-count pairs.
 `--gin-contexts` and `--gin-queue-depth` apply to the NCCL GIN and LSA +
 railed-GIN exercises. A context value of `0` (the default) requests one GIN
 context per CTA, so it preserves the original `--blocks` behavior. Set it to
-`1..--blocks` to sweep context sharing independently of CTA count.
+`1..--blocks` to sweep context sharing independently of CTA count. On the
+railed-GIN exercise, sharing contexts measurably hurts: 8 or 16 contexts across
+40 CTAs cost about 13% against one context per CTA.
 
 `--profile-phases` applies to the solved LSA + railed-GIN implementation. It
-keeps the one-kernel collective intact and emits an in-kernel CTA trace for
-send/local delivery plus the cooperative handoff, signal wait, LSA scatter,
-flush, and final completion barrier. It is a diagnostic run, not a
-headline-performance run: it records CUDA events and trace values for each
-iteration.
-
-The LSA + railed-GIN exercise additionally accepts `--network-issuers N`,
-`--async-flush`, `--credit-pipeline`, `--strong-data-signals`, and
-`--epoch-stress N`.
-`--async-flush` is a two-rail source-completion overlap experiment: it begins
-the peer-specific flush before receive work, waits for its request before the
-final reuse barrier, and otherwise falls back to a synchronous flush.
-`--credit-pipeline` is a separate two-rail experiment: it double-buffers the
-network inbox, uses separate per-slot data and credit signals, and replaces the
-cross-domain world barrier with an LSA barrier plus returned credits. It
-requests four GIN signal IDs per CTA and doubles the inbox allocation, so start
-with the default world-barrier path. `--strong-data-signals` requires that
-credit path and a backend with strong GIN signals; it replaces the per-put weak
-data notifications with one terminal strong signal per CTA. It is mainly a
-high-fanout or multi-issuer experiment, not a default. The async and credit
-experiments are mutually exclusive. The other exercises reject these
-hybrid-only controls.
-
-`--epoch-stress N` is a validation-only credit-pipeline diagnostic. After the
-timed run and ordinary reuse check, it clears the receive buffer, changes every
-rank's send-buffer values before each of `N` back-to-back epochs, and validates
-both final inbox parities against their accumulated biases. It requires an
-active two-rail `--credit-pipeline` and `N >= 4`, so both inbox stages are
-reused; it adds no timing-loop events or per-epoch host synchronization. A
-one-time device LSA barrier after the penultimate snapshot prevents a local
-peer's final-epoch direct store from racing that snapshot.
+keeps the one-kernel collective intact and stamps five per-CTA timestamps, then
+splits the measured time across issue plus local delivery, the wait for inbound
+shards, the LSA scatter, the GIN flush, and the completion barrier. It is a
+diagnostic run, not a headline-performance run. It is also the fastest way to
+see why the hybrid sits well under the rail line rate; see
+[04-nccl-lsa-gin-alltoallv](04-nccl-lsa-gin-alltoallv/).
 
 The programs first validate one iteration, then time warm and measured
 iterations. The output separates self, same-domain, and cross-domain bytes.
@@ -163,162 +140,3 @@ separately. The combined logical rate from a mixed run is not an IB bandwidth
 number. The hybrid algorithm writes each cross-domain byte to an ingress
 inbox, then uses one local scatter when the destination has a different LSA
 rank. That extra local hop is the cost of rail-only connectivity.
-
-## The three tuning steps
-
-The solved versions use the same three changes in forms appropriate to each
-API:
-
-1. **Shard a large peer message.** One transfer does not create enough
-   parallel work. NCCL stripes shards over GIN contexts; NVSHMEM uses smaller
-   direct chunks and larger network chunks.
-2. **Map the shards to the hardware.** Work is spread over CTAs, contexts, QP
-   handles, and rails. The hybrid NCCL path sends only to the matching rail
-   peer, then scatters with LSA.
-3. **Separate issue from handoff.** Nonblocking puts run before the receiver
-   waits. Put-with-signal or a weak GIN signal makes the payload visible; one
-   delayed quiet or flush protects buffer reuse. There is no quiet or flush
-   after every shard.
-
-Use `--blocks` to expose the first two effects. On the NCCL GIN paths,
-`--gin-contexts` and `--gin-queue-depth` decouple requested GIN resources from
-CTA count; the setup reports the requested and created resources and rejects a
-cross-rank mismatch. The NVSHMEM lab also exposes
-`HOTI_ALLTOALLV_CHUNK_BYTES`, `HOTI_ALLTOALLV_NETWORK_CHUNK_BYTES`, and
-`HOTI_ALLTOALLV_NETWORK_QPS`. Change one setting at a time and keep the
-offdiagonal payload fixed.
-
-## Performance targets on GB200 and GB300 NVL72
-
-Use 75% of the hardware path SoL as the stretch target for large, balanced,
-offdiagonal traffic. Also measure the matching primitive on the same
-allocation: direct peer copy for NVLink and a large put for GIN or NVSHMEM
-IBGDA. If the primitive itself is below the hardware line rate, report both
-percentages and require the AlltoAllV to reach at least 75% of that measured
-primitive reference. The primitive is a data-path baseline, not necessarily a
-strict upper bound: the collective may expose more parallel work. This keeps
-an API or transport limit visible instead of crediting it to the collective.
-Do not apply a fixed percentage to small, sparse, or strongly skewed messages;
-launch and load-imbalance costs dominate those cases.
-
-Both platforms have 1.8 TB/s bidirectional NVLink per GPU, or 900 GB/s in the
-one-way send metric used here. The selected IB rail differs: GB200 uses a
-400 Gb/s ConnectX-7 rail (50 GB/s one way), while GB300 uses an 800 Gb/s
-ConnectX-8 rail (100 GB/s one way). These system capabilities are documented
-in the [GB200 tuning guide](https://docs.nvidia.com/multi-node-nvlink-systems/multi-node-tuning-guide/overview.html),
-[GB200 rack reference](https://docs.nvidia.com/dgx-superpod/reference-architecture-scalable-infrastructure-gb200/latest/dgx-superpod-components.html),
-and [GB300 specifications](https://www.nvidia.com/en-us/data-center/gb300-nvl72/).
-
-For the one-rail placements below, the corresponding aggregate logical
-ceilings are:
-
-| Placement | GB200 raw SoL | GB200 75% | GB300 raw SoL | GB300 75% |
-| --- | ---: | ---: | ---: | ---: |
-| 8 GPUs in one NVL72 | 7.2 TB/s | 5.4 TB/s | 7.2 TB/s | 5.4 TB/s |
-| 4 GPUs in four NVL72s, one rail each | 0.2 TB/s | 0.15 TB/s | 0.4 TB/s | 0.3 TB/s |
-| 2 NVL72s x 8 GPUs, LSA + railed GIN | 1.5 TB/s | 1.125 TB/s | 3.0 TB/s | 2.25 TB/s |
-
-These are aggregate logical send rates across all ranks, matching the metric
-printed by the programs; they are not per-GPU bandwidths.
-
-The IB-only row deliberately selects one HCA per rank so the NCCL and
-NVSHMEM runs have the same denominator. An NVSHMEM run that enables four
-rails for each single-PE tray has a 0.8 TB/s GB200 or 1.6 TB/s GB300 aggregate
-raw ceiling, not the one-rail number. Label that as a separate multi-port
-result, and use the negotiated link rate rather than the adapter's marketing
-rate when a rail is degraded or absent.
-
-The hybrid number is traffic weighted. With two eight-GPU domains,
-offdiagonal AlltoAllV sends `7/15` of its bytes inside an LSA domain and
-`8/15` across the network. The network is the limiting path, so the combined
-logical SoL is `1.6 TB/s / (8/15) = 3.0 TB/s`.
-
-## GB300 Lyris reference comparison
-
-These are the best validated 256 MiB/rank offdiagonal results from the tuning
-runs. The NVSHMEM column uses the same source in all three rows. The NCCL
-column switches between the topology-specific implementations.
-
-| Placement | NVSHMEM | NCCL device API | NCCL implementation |
-| --- | ---: | ---: | --- |
-| 8 GPUs in one NVL72 | 3.76 TB/s (52% raw SoL) | 4.67 TB/s (65%) | LSA |
-| 4 GPUs in four NVL72s, one rail each | 205.7 GB/s (51%) | 225.2 GB/s (56%) | Full GIN |
-| 2 NVL72s x 8 GPUs | 1.52 TB/s (51%) | 1.45 TB/s (48%) | LSA + railed GIN |
-
-Every run passed the initial full-buffer check and the receive-buffer reuse
-check. The single-rail NVSHMEM and NCCL figures were measured back-to-back on
-the same allocation. The other rows report each implementation's best
-validated run.
-
-None reaches 75% of raw hardware SoL. The data-path references were below raw
-SoL as well. In their matching tuning runs, the solved NVSHMEM implementation
-reached 98% of the direct reference, 101% of the single-rail reference, and
-about 100% of the mixed reference. The NCCL implementations reached 87% of
-the LSA reference, 88% of the full-GIN reference, and 89% of the strict hybrid
-component roof. All six therefore clear the practical target of 75% of their
-measured references. Those percentages come from paired reference/solution
-runs, not from dividing the best-of-sweep table above. The full-GIN pair used
-64 MiB/rank; the other pairs used 256 MiB/rank.
-
-The comparison is topology dependent. NCCL led on the direct LSA and
-single-rail full-GIN placements. The two-NVL72 hybrid result predates its
-single-kernel cooperative fusion, so rerun that placement before using the
-historical mixed-path comparison.
-
-The harness uses MPI only for bootstrap, metadata needed to construct the
-reference answer, error reduction, and benchmark alignment. MPI is not the
-data path being measured.
-
-## Topology test matrix
-
-Use the solved binaries to establish a baseline before changing the starters.
-Chapter 9 defaults to `CUDA_ARCHS='100 103'` for native GB200 and GB300
-code; use `CUDA_ARCH=90` explicitly for a Jupiter GH200 build.
-
-For NVLink within one LSA domain:
-
-```bash
-make -C 01-nvshmem-alltoallv
-make -C 01-nvshmem-alltoallv run_SOLVED NP=4 \
-  LAUNCHER='srun --nodes=1 --ntasks=4 --gpus-per-task=1'
-
-make -C 02-nccl-lsa-alltoallv
-make -C 02-nccl-lsa-alltoallv run_SOLVED NP=4 \
-  LAUNCHER='srun --nodes=1 --ntasks=4 --gpus-per-task=1' \
-  RUN_ARGS='--blocks 128'
-```
-
-On Lyris, `--segment` is the number of compute trays placed in one NVL72 base
-block. These allocations produce the three benchmark placements:
-
-```text
-NVLink:   --nodes=2 --segment=2
-IB:       --nodes=4 --segment=1 --spread-segments
-Hybrid:   --nodes=4 --segment=2 --spread-segments
-```
-
-Pass `--segment` and `--spread-segments` to `sbatch` or `salloc` when creating
-the allocation, not only to a later `srun`: a step cannot repair an allocation
-whose trays all came from one NVL72 base block. For example, the hybrid lab
-needs two trays in each of two base blocks:
-
-```bash
-sbatch --account=coreai_libraries_nvshmem --partition=gb300-backfill \
-  --qos=user-restrictions --nodes=4 --ntasks=16 --ntasks-per-node=4 \
-  --segment=2 --spread-segments --time=00:10:00 ...
-```
-
-The hybrid executable confirms this preflight itself: a valid run reports
-`world=16, LSA=8, rail=2`, and `railed GIN=GDAKI`; otherwise it prints `SKIP`
-before launching a kernel.
-
-Use four tasks and GPUs per tray for the NVLink and hybrid rates in the table.
-Use one task and GPU per tray for the IB-only rate. Lyris does not expose its
-GPUs as Slurm GRES, so omit `--gpus-per-task`; each program selects a GPU from
-the MPI local rank. The leaf commands select PMIx explicitly. Add `--overlap`
-when launching them from inside an existing `srun` step. The leaf READMEs give
-complete commands and explain a legitimate `SKIP` result.
-
-The NCCL labs require NCCL 2.31.2 or newer. They use Hopper-compatible LSA and
-GIN APIs only; none uses NVLS, multimem instructions, or a Blackwell-only
-feature.

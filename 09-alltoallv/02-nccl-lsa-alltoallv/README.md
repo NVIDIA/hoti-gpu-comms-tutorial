@@ -25,20 +25,39 @@ communication.
 
 ## What the kernel does
 
-Every CTA works on a different shard of every source-to-destination segment.
+The algorithm is the simplest one in this chapter: every rank stores every
+outgoing message straight into its peer's receive window, all at the same
+time. There is no handshake per message and no staging buffer. Only two things
+have to be decided - when it is safe to start, and which bytes each CTA owns.
+
 For each LSA peer, the kernel:
 
 1. translates the LSA-team rank to its world rank so it can select the correct
    plan entry;
-2. gets the local source address with `ncclGetLocalPointer`;
-3. gets the destination address with `ncclGetLsaPointer`;
-4. copies aligned 16-byte vectors, followed by any remaining elements.
+2. takes one contiguous, 16-byte-aligned slice of that message with
+   `shard_slice(count, blockIdx.x, gridDim.x, ...)`;
+3. gets the local source address with `ncclGetLocalPointer`;
+4. gets the destination address with `ncclGetLsaPointer`;
+5. copies aligned 16-byte vectors, followed by any remaining elements.
 
 The peer order is offset by both the source rank and the CTA index. At a given
 step, different sources write different destinations, and different CTAs do
 not all work on the same peer at once. Every CTA owns a different slice of
 every message, so changing the visit order does not change which bytes it
 copies.
+
+`copy_values` keeps four 16-byte stores in flight per thread rather than one.
+This exposes more independent stores to the NVLink write path without changing
+which bytes each thread owns.
+
+[04-nccl-lsa-gin-alltoallv](../04-nccl-lsa-gin-alltoallv/) shares `shard_slice`
+and the same peer-rotation idea, but keeps its `copy_values` at one store in
+flight on purpose. The extra registers cost more occupancy than they buy in a
+kernel that is network-bound. The helper is a good place to look at the two
+labs side by side.
+
+The implementation stays with 16-byte vectors. Wider source-level stores are
+not useful when the compiler lowers them into multiple sparse 16-byte stores.
 
 The kernel uses one LSA barrier per CTA. The acquire barrier at entry ensures
 that every rank has entered the operation before stores begin. The
@@ -96,55 +115,3 @@ compiled against implementation details in those headers. The default emits
 native `sm_100` (GB200) and `sm_103` (GB300) code. Use
 `CUDA_ARCHS='90 100 103'` for a compatible fat binary, or `CUDA_ARCH=90` for a
 GH200-only build.
-
-## Run on NVLink
-
-Run one MPI rank per GPU in a single LSA domain. For example, inside a Slurm
-allocation:
-
-```bash
-make run_SOLVED NP=4 \
-  LAUNCHER="srun --nodes=1 --ntasks=4 --gpus-per-task=1" \
-  RUN_ARGS="--blocks 128"
-```
-
-On Lyris, eight GPUs across two trays in one NVL72 form one LSA domain. Lyris
-does not expose GPU GRES, so omit `--gpus-per-task`:
-
-```bash
-make run_SOLVED NP=8 \
-  LAUNCHER="srun --mpi=pmix_v5 --nodes=2 --ntasks=8 --ntasks-per-node=4 --segment=2" \
-  RUN_ARGS="--pattern offdiagonal --bytes-per-rank 256M --blocks 1024 --threads 256 --warmup 20 --iters 100"
-```
-
-The `1024 x 256` launch was the best 256 MiB/rank starting point in the Lyris
-sweep used for this lab. Sweep the CTA count again on another GPU, message
-size, or LSA topology.
-
-Change the traffic pattern and payload with `RUN_ARGS`:
-
-```bash
-make run_SOLVED NP=4 \
-  LAUNCHER="srun --nodes=1 --ntasks=4 --gpus-per-task=1" \
-  RUN_ARGS="--pattern sparse --bytes-per-rank 16M --blocks 128 --warmup 10 --iters 50"
-```
-
-For large messages, CTA count controls how finely each peer segment is split.
-Start with `--blocks 128` and measure; a small grid can leave much of the
-NVLink copy bandwidth unused, while the best value depends on the GPU and
-message size.
-
-If the communicator is not one LSA domain, the program prints `SKIP` rather
-than attempting invalid peer accesses. A successful run ends with output like:
-
-```text
-NCCL topology: world=4, LSA=4, rail=1
-NCCL LSA AlltoAllV correctness: PASS
-NCCL LSA AlltoAllV performance: ... ms/iteration, ... GB/s logical non-self
-NCCL LSA AlltoAllV placement payload rates (NCCL LSA): ... GB/s same-domain non-self, 0.000 GB/s cross-domain
-```
-
-The reported bandwidth counts payload sent to other ranks and uses the
-slowest rank's elapsed time.
-
-Further reading: [NCCL Device API](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/deviceapi.html) and [Device memory and LSA pointers](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/api/device_memory.html).

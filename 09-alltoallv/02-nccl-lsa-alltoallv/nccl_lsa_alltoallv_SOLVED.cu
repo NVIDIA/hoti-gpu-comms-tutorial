@@ -19,24 +19,47 @@ using alltoallv::DevicePlanEntry;
 using alltoallv::value_type;
 using alltoallv::nccl_setup::State;
 
-__device__ void copy_segment(const value_type *source, value_type *destination,
-                             std::uint64_t count) {
-  constexpr std::uint64_t kVectorElements = sizeof(uint4) / sizeof(value_type);
-  const std::uint64_t global_thread =
-      static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const std::uint64_t global_stride =
-      static_cast<std::uint64_t>(gridDim.x) * blockDim.x;
-  const std::uint64_t vector_count = count / kVectorElements;
+constexpr std::uint64_t kVectorElements = sizeof(uint4) / sizeof(value_type);
 
+// Split count into `shards` aligned, contiguous pieces and return piece
+// `shard`. The last piece owns any scalar tail.
+__device__ void shard_slice(std::uint64_t count, int shard, int shards,
+                            std::uint64_t *offset, std::uint64_t *slice) {
+  const std::uint64_t vectors = count / kVectorElements;
+  const std::uint64_t begin = vectors * shard / shards;
+  const std::uint64_t end = vectors * (shard + 1) / shards;
+  *offset = begin * kVectorElements;
+  const std::uint64_t limit =
+      shard + 1 == shards ? count : end * kVectorElements;
+  *slice = limit - *offset;
+}
+
+// Copy one contiguous slice with this CTA's own threads. Four 16-byte stores
+// stay in flight per thread, which is what keeps the NVLink write path busy
+// without needing a very large grid.
+__device__ void copy_values(const value_type *source, value_type *destination,
+                            std::uint64_t count) {
+  const std::uint64_t vector_count = count / kVectorElements;
   const uint4 *source_vectors = reinterpret_cast<const uint4 *>(source);
   uint4 *destination_vectors = reinterpret_cast<uint4 *>(destination);
-  for (std::uint64_t vector = global_thread; vector < vector_count;
-       vector += global_stride)
+  const std::uint64_t stride = blockDim.x;
+  std::uint64_t vector = threadIdx.x;
+  for (; vector + 3 * stride < vector_count; vector += 4 * stride) {
+    const uint4 a = source_vectors[vector];
+    const uint4 b = source_vectors[vector + stride];
+    const uint4 c = source_vectors[vector + 2 * stride];
+    const uint4 d = source_vectors[vector + 3 * stride];
+    destination_vectors[vector] = a;
+    destination_vectors[vector + stride] = b;
+    destination_vectors[vector + 2 * stride] = c;
+    destination_vectors[vector + 3 * stride] = d;
+  }
+  for (; vector < vector_count; vector += stride)
     destination_vectors[vector] = source_vectors[vector];
 
   const std::uint64_t tail = vector_count * kVectorElements;
-  for (std::uint64_t element = tail + global_thread; element < count;
-       element += global_stride)
+  for (std::uint64_t element = tail + threadIdx.x; element < count;
+       element += stride)
     destination[element] = source[element];
 }
 
@@ -58,12 +81,17 @@ __global__ void nccl_lsa_alltoallv_kernel(ncclDevComm dev_comm,
         lsa_team.nRanks;
     const int world_peer = ncclTeamRankToWorld(dev_comm, lsa_team, lsa_peer);
     const DevicePlanEntry entry = entries[world_peer];
+    std::uint64_t offset = 0;
+    std::uint64_t count = 0;
+    shard_slice(entry.send_count, static_cast<int>(blockIdx.x),
+                static_cast<int>(gridDim.x), &offset, &count);
     const value_type *source =
         static_cast<const value_type *>(ncclGetLocalPointer(
-            send_window, entry.send_offset * sizeof(value_type)));
+            send_window, (entry.send_offset + offset) * sizeof(value_type)));
     value_type *destination = static_cast<value_type *>(ncclGetLsaPointer(
-        recv_window, entry.remote_recv_offset * sizeof(value_type), lsa_peer));
-    copy_segment(source, destination, entry.send_count);
+        recv_window, (entry.remote_recv_offset + offset) * sizeof(value_type),
+        lsa_peer));
+    copy_values(source, destination, count);
   }
 
   barrier.sync(ncclCoopCta(), cuda::memory_order_acq_rel);
