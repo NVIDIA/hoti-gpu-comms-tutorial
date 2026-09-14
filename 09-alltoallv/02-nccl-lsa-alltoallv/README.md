@@ -64,7 +64,7 @@ that every rank has entered the operation before stores begin. The
 acquire-release barrier at exit publishes this rank's peer stores and ensures
 that stores from the other ranks are visible before the receiving kernel
 returns to its CUDA stream. This lab requests ordinary LSA barriers and passes
-`multimem=false`; it does not require NVLS or multimem instructions.
+`multimem=false`.
 
 The relevant NCCL 2.31.2 device APIs are:
 

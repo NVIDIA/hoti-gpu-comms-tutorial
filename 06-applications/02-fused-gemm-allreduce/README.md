@@ -13,8 +13,7 @@ The lab has NVSHMEM and NCCL implementations of the same operation:
 | NCCL | Store into a symmetric NCCL window | LSA barrier | Load the peer's window with an LSA pointer |
 
 Both versions run on two GPUs. The NCCL version uses the ordinary LSA path for
-a single NVLink domain. It does not use NVLS, `multimem`, or any Blackwell-only
-instructions.
+a single NVLink domain.
 
 ## Source files
 

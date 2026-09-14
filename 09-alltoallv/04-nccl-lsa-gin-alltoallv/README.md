@@ -218,7 +218,3 @@ make NCCL_HOME=/path/to/nccl CUDA_HOME=/path/to/cuda
 The build defaults to native `sm_100` (GB200) and `sm_103` (GB300) code. Use
 `CUDA_ARCHS='90 100 103'` for a compatible fat binary, or `CUDA_ARCH=90` for a
 GH200-only build.
-
-This implementation uses Hopper-compatible loads, stores, LSA pointers, and
-GIN operations. It does not require NVLS, multimem instructions, or a
-Blackwell-only feature.
