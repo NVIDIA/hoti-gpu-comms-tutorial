@@ -19,10 +19,10 @@ LDLIBS := -lcudart -lnvshmem_host -lnvshmem_device
 
 all: put_barrier put_barrier_SOLVED
 
-put_barrier: put_barrier.cu ../../common/nvshmem_exercise.h
+put_barrier: put_barrier.cu ../../09-alltoallv/common/nvshmem_exercise.h
 	$(NVCC) -ccbin $(MPICXX) $(CPPFLAGS) $(NVCCFLAGS) $< $(LDFLAGS) $(LDLIBS) -o $@
 
-put_barrier_SOLVED: put_barrier_SOLVED.cu ../../common/nvshmem_exercise.h
+put_barrier_SOLVED: put_barrier_SOLVED.cu ../../09-alltoallv/common/nvshmem_exercise.h
 	$(NVCC) -ccbin $(MPICXX) $(CPPFLAGS) $(NVCCFLAGS) $< $(LDFLAGS) $(LDLIBS) -o $@
 
 run: put_barrier

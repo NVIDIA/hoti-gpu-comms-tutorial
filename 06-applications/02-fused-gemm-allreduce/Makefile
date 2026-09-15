@@ -38,10 +38,10 @@ nvshmem: $(NVSHMEM_BINS)
 
 nccl: $(NCCL_BINS)
 
-fused_gemm_allreduce: fused_gemm_allreduce.cu ../../common/nvshmem_exercise.h
+fused_gemm_allreduce: fused_gemm_allreduce.cu ../../09-alltoallv/common/nvshmem_exercise.h
 	$(NVCC) -ccbin $(MPICXX) $(CUDA_CPPFLAGS) $(NVSHMEM_CPPFLAGS) $(NVCCFLAGS) $< $(CUDA_LDFLAGS) $(NVSHMEM_LDFLAGS) $(NVSHMEM_LDLIBS) -o $@
 
-fused_gemm_allreduce_SOLVED: fused_gemm_allreduce_SOLVED.cu ../../common/nvshmem_exercise.h
+fused_gemm_allreduce_SOLVED: fused_gemm_allreduce_SOLVED.cu ../../09-alltoallv/common/nvshmem_exercise.h
 	$(NVCC) -ccbin $(MPICXX) $(CUDA_CPPFLAGS) $(NVSHMEM_CPPFLAGS) $(NVCCFLAGS) $< $(CUDA_LDFLAGS) $(NVSHMEM_LDFLAGS) $(NVSHMEM_LDLIBS) -o $@
 
 fused_gemm_allreduce_nccl: fused_gemm_allreduce_nccl.cu ../../05-nccl-device-apis/device_api_common.hpp

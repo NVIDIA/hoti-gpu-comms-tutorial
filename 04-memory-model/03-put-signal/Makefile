@@ -19,10 +19,10 @@ LDLIBS := -lcudart -lnvshmem_host -lnvshmem_device
 
 all: put_signal put_signal_SOLVED
 
-put_signal: put_signal.cu ../../common/nvshmem_exercise.h
+put_signal: put_signal.cu ../../09-alltoallv/common/nvshmem_exercise.h
 	$(NVCC) -ccbin $(MPICXX) $(CPPFLAGS) $(NVCCFLAGS) $< $(LDFLAGS) $(LDLIBS) -o $@
 
-put_signal_SOLVED: put_signal_SOLVED.cu ../../common/nvshmem_exercise.h
+put_signal_SOLVED: put_signal_SOLVED.cu ../../09-alltoallv/common/nvshmem_exercise.h
 	$(NVCC) -ccbin $(MPICXX) $(CPPFLAGS) $(NVCCFLAGS) $< $(LDFLAGS) $(LDLIBS) -o $@
 
 run: put_signal

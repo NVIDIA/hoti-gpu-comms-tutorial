@@ -38,11 +38,11 @@ all: $(BINS)
 $(BINS): ../alltoallv_build.mk
 
 nvshmem_alltoallv: nvshmem_alltoallv.cu ../alltoallv_common.hpp \
-	../../common/nvshmem_exercise.h
+	../common/nvshmem_exercise.h
 	$(NVCC) $(NVCC_FLAGS) $< -o $@ $(NVCC_LDFLAGS)
 
 nvshmem_alltoallv_SOLVED: nvshmem_alltoallv_SOLVED.cu \
-	../alltoallv_common.hpp ../../common/nvshmem_exercise.h
+	../alltoallv_common.hpp ../common/nvshmem_exercise.h
 	$(NVCC) $(NVCC_FLAGS) $< -o $@ $(NVCC_LDFLAGS)
 
 run: nvshmem_alltoallv

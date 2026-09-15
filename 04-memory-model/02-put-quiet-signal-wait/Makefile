@@ -19,10 +19,10 @@ LDLIBS := -lcudart -lnvshmem_host -lnvshmem_device
 
 all: put_quiet_signal_wait put_quiet_signal_wait_SOLVED
 
-put_quiet_signal_wait: put_quiet_signal_wait.cu ../../common/nvshmem_exercise.h
+put_quiet_signal_wait: put_quiet_signal_wait.cu ../../09-alltoallv/common/nvshmem_exercise.h
 	$(NVCC) -ccbin $(MPICXX) $(CPPFLAGS) $(NVCCFLAGS) $< $(LDFLAGS) $(LDLIBS) -o $@
 
-put_quiet_signal_wait_SOLVED: put_quiet_signal_wait_SOLVED.cu ../../common/nvshmem_exercise.h
+put_quiet_signal_wait_SOLVED: put_quiet_signal_wait_SOLVED.cu ../../09-alltoallv/common/nvshmem_exercise.h
 	$(NVCC) -ccbin $(MPICXX) $(CPPFLAGS) $(NVCCFLAGS) $< $(LDFLAGS) $(LDLIBS) -o $@
 
 run: put_quiet_signal_wait

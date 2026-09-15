@@ -147,8 +147,9 @@ The directory names follow the same order:
 09-alltoallv/
 ```
 
-`common/nvshmem_exercise.h` supplies shared CUDA, MPI, and NVSHMEM setup for
-the NVSHMEM RMA and memory-model exercises.
+`09-alltoallv/common/nvshmem_exercise.h` supplies shared CUDA, MPI, and
+NVSHMEM setup reused by the NVSHMEM RMA, memory-model, fused-GEMM, and
+AlltoAllV exercises.
 `05-nccl-device-apis/device_api_common.hpp` supplies the NCCL communicator,
 symmetric-window, and device-communicator setup reused by the NCCL fused-GEMM
 implementation.

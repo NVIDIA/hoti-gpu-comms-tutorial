@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 
-#include "../../common/nvshmem_exercise.h"
+#include "../../09-alltoallv/common/nvshmem_exercise.h"
 
 __global__ void store_through_peer_pointer(int *symmetric_value, int value,
                                            int peer) {

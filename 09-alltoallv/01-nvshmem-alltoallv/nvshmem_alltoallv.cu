@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 
-#include "../../common/nvshmem_exercise.h"
+#include "../common/nvshmem_exercise.h"
 #include "../alltoallv_common.hpp"
 
 #include <cooperative_groups.h>

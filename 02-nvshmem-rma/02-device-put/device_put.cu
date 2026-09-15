@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 
-#include "../../common/nvshmem_exercise.h"
+#include "../../09-alltoallv/common/nvshmem_exercise.h"
 
 __global__ void put_to_next_pe(int *target, const int *source, int next_pe) {
   if (blockIdx.x == 0 && threadIdx.x == 0) {
